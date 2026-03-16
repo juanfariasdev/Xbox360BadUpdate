@@ -1441,3 +1441,323 @@ _hdd_symlink_path_str:
 ```
 
 Em outras palavras: usar o mesmo caminho de HDD (`\Device\Harddisk0\Partition1\BadUpdatePayload`) tanto para `DEBUG_BUILD` quanto para `RETAIL_BUILD`, em vez de usar o path do USB no `RETAIL_BUILD`. O assembler recalcularia automaticamente o `hdd_symlink_path_str_length` e todos os endereços do segmento de dados. Nenhum outro arquivo de código fonte precisaria ser alterado.
+
+---
+
+# Suporte a múltiplas versões de kernel — o que precisaria mudar
+
+**Contexto:** Atualmente o exploit compila apenas para o kernel retail **17559** (`KernelConfig_Retail_17559.asm`). A dependência de versão de kernel é **independente** do jogo-alvo (Tony Hawk, Rock Band Blitz, etc.): qualquer combinação jogo + versão de kernel requer o `KernelConfig` adequado. Tudo que envolve endereços de funções, gadgets ROP, dados do hypervisor e o próprio payload de atualização está calibrado para a versão 17559 em específico. Para portar o exploit para outro kernel seria necessário mapear e atualizar seis categorias de dados independentes.
+
+---
+
+## Por que o exploit é específico de versão?
+
+A resposta curta: o exploit executa código arbitrário usando uma ROP chain cujos gadgets são instruções reais do kernel e do XAM, com endereços que mudam a cada versão. Além disso, o Stage 4 (payload do hypervisor) contém endereços físicos de funções internas do HV e de bytes-alvo a patchear — todos derivados de reverse engineering do firmware 17559 em específico.
+
+---
+
+## Categoria 1 — Endereços de funções do kernel (Stage 2 + Stage 3)
+
+O arquivo `Common/KernelConfig_Retail_17559.asm` define 16 endereços de funções do kernel:
+
+```
+DbgPrint, DbgBreakPoint, HalSendSMCMessage, KeFlushCacheRange, KeLockL2,
+KeStallExecutionProcessor, MmFreePhysicalMemory, MmGetPhysicalAddress,
+NtAllocateVirtualMemory, NtClose, ObCreateSymbolicLink, RtlInitAnsiString,
+VdDisplayFatalError, XexLoadImage, XexUnloadImage, memcmp
+```
+
+Essas funções são exportadas (ou localizáveis por símbolo) no binário do kernel. Para um kernel diferente:
+
+1. Extrair o binário do kernel da atualização (o kernel é o arquivo protegido pelo HV dentro do `update_data.bin`)
+2. Abrir em disassembler (IDA Pro, Ghidra, Radare2 com suporte a PPC big-endian)
+3. Localizar cada símbolo e anotar o novo endereço
+4. Atualizar `KernelConfig_Retail_<versão>.asm`
+
+**Dificuldade:** Média — funções exported têm nomes conhecidos; funções como `memcmp` precisam de busca por padrão de bytes.
+
+---
+
+## Categoria 2 — Endereços de funções do XAM (Stage 2)
+
+O kernel config também define 12 endereços de funções do XAM (o módulo de dashboard/sistema):
+
+```
+CreateFileA (export 1095), GetFileSize (export 1063), ReadFile (export 1052),
+WriteFile (export 1054), CloseHandle (export 1044), CreateThread (export 1084),
+ResumeThread (export 1085), GetLastError (export 1006),
+memcpy, memset, XamLoaderLaunchTitle (export 420), XamLoaderTerminateTitle (export 425)
+```
+
+O XAM.xex está na flash do console em `\Device\Flash\`. Para um kernel diferente:
+
+1. Extrair o `xam.xex` correspondente à versão (fica na atualização do dashboard)
+2. Descriptografar/desempacotar o formato XEX2
+3. Localizar cada export pelo número de ordinal documentado ao lado
+4. Para `memcpy` e `memset` — busca por padrão de bytes
+5. Atualizar `KernelConfig_Retail_<versão>.asm`
+
+**Dificuldade:** Baixa — ordinals são fixos por design do ABI do Xbox 360; basta resolver o endereço do export table.
+
+---
+
+## Categoria 3 — System call ordinals e wrappers (Stage 3)
+
+O kernel config define 7 ordinals de syscall e 6 endereços de funções-wrapper:
+
+```
+# Ordinals (mudam por versão de kernel):
+sc_HvxPostOutputExploit (0x0D), sc_HvxFlushUserModeTb (0x21),
+sc_HvxKeysExecute (0x42), sc_HvxEncryptedReserveAllocation (0x49),
+sc_HvxEncryptedEncryptAllocation (0x4A), sc_HvxEncryptedReleaseAllocation (0x4C),
+sc_HvxRevokeUpdate (0x65)
+
+# Wrappers no kernel (endereços fixos do kernel, mesma metodologia da Categoria 1):
+HvxKeysExGetKey, HvxKeysExSetKey, HvxEncryptedReserveAllocation,
+HvxEncryptedReleaseAllocation, HvxEncryptedEncryptAllocation, HvxFlushDCacheRange
+```
+
+Os ordinals de syscall são definidos pelo hypervisor e podem variar entre versões. Para localizá-los: procurar por `sc` (opcode `0x44000002`) nos wrappers do kernel e ler o campo imediato da instrução `li r0, <ordinal>` que precede o `sc`.
+
+**Dificuldade:** Baixa-média — wrappers facilmente identificáveis; os ordinals estão embutidos no código dos wrappers.
+
+---
+
+## Categoria 4 — Gadgets ROP no kernel e no XAM (Stage 2, Stage 1)
+
+Esta é a categoria mais numerosa. O kernel config define ~22 gadgets ROP — sequências de instruções específicas cujos endereços são usados para construir as cadeias ROP:
+
+```
+# Gadgets no kernel:
+__restgprlr_24, __restgprlr_26, __restgprlr_27, __restgprlr_28,
+__restgprlr_29, __restgprlr_30, __restgprlr_31, stw_r3, mr_r31_to_r3,
+mr_r31_to_r11, call_func_dispatch
+
+# Gadgets no XAM:
+stack_pivot, lwz_r3, lwz_r3_stw_r4, lwz_r10, lwz_r11_off_r31,
+stw_r30_on_r31, stw_r3_onto_pointer, load_add_store_r10_r5_on_r11,
+call_func_preload, mr_r1_to_r3, blr_nop, clamp_r3,
+mul_r3_4_lwzx_r11, load_add_store_r11_r30_on_r31, call_ptr_off_r31
+
+# Offsets do call_func_preload (dependem do stack frame do gadget):
+cf_r3_offset (0x2C), cf_r4_offset (0x24), cf_r5_offset (0x1C),
+cf_r6_offset (0x14), cf_r7_offset (0x0C)
+```
+
+Cada gadget é comentado no arquivo com a sequência exata de instruções que deve conter. Para portar:
+
+1. Escrever um scanner de bytes que busca a sequência de opcodes PPC de cada gadget no binário do kernel / XAM
+2. Para gadgets `__restgprlr_*`: são funções de epilogue padrão do compilador — padrão bem reconhecido
+3. Para gadgets XAM: o XAM muda mais entre versões que o kernel, então mais atenção é necessária aqui
+4. Os offsets `cf_r*_offset` dependem do stack layout de `call_func_preload` — verificar se mudaram
+
+**Dificuldade:** Média-alta — scan de gadgets é automático, mas o XAM pode não ter todos os gadgets necessários na nova versão.
+
+---
+
+## Categoria 5 — `BootAnimCodePageAddress` (Stage 3)
+
+```asm
+# Em KernelConfig_Retail_17559.asm:
+.set BootAnimCodePageAddress, 0x98030000
+```
+
+Este endereço é onde o `bootanim.xex` (a animação de boot do dashboard) é carregado na memória. **O Stage 3 inteiro é montado para executar a partir deste endereço** — a macro `DATA_ADDR` calcula todos os endereços internos como `BootAnimCodePageAddress + offset`.
+
+Se o endereço mudar para a nova versão:
+- É necessário **recompilar o Stage 3 do zero** (arquivo `Stage3/BadUpdateExploit-3rdStage.asm`)
+- O author original avisa que isso é difícil — o Stage 3 foi escrito como assembly compilado a partir de C em partes isoladas
+- Se o endereço não mudar (o que é possível — ele pode ser fixo na ABI), o binário pré-compilado continua funcionando
+
+**Como verificar:** Debugar (ou analisar) a carga do `bootanim.xex` na versão alvo e confirmar o endereço de base.
+
+**Dificuldade:** Alta se o endereço mudar (recompilação do Stage 3 manual); Baixa se o endereço for o mesmo.
+
+---
+
+## Categoria 6 — Dados específicos do hypervisor (Stage 4) ⚠️ A mais difícil
+
+O Stage 4 (`Stage4/BadUpdateExploit-4thStage.asm`) contém quatro peças de dados hardcoded que requerem reverse engineering do próprio hypervisor — o componente mais protegido do sistema:
+
+### 6a. Endereços de funções internas do HV
+
+```asm
+.set HvpRelocateCacheLines,  0x00000E14   # função interna, não exportada
+.set HvpSetRMCI,             0x00000398   # função interna, não exportada
+```
+
+Essas são funções não-exportadas dentro do hypervisor. Para localizá-las:
+- Extrair e descriptografar o binário do hypervisor da imagem de atualização
+- No IDA/Ghidra, identificar `HvpRelocateCacheLines` pelo padrão de comportamento (mover cache lines usando `dcbst`/`sync`) e `HvpSetRMCI` pelo padrão de escrita no registro RMCI do processador
+
+### 6b. Endereço do patch no HV (bypass de verificação de assinatura RSA)
+
+```asm
+hv_rsa_patch_address:
+    .long 0x80000104, 0x00029B04   # instrução 'bl XeCryptBnQwBeSigVerify' em HvpImageSignatureVerification
+```
+
+Este é o endereço físico da instrução `bl XeCryptBnQwBeSigVerify` dentro de `HvpImageSignatureVerification` no hypervisor — ou seja, o endereço da instrução **original** `bl` que o Stage 4 sobrescreve com `li r3, 1` para que a verificação sempre retorne "assinatura válida".
+
+Para localizar: no binário do HV, encontrar a função `HvpImageSignatureVerification` e identificar a chamada para `XeCryptBnQwBeSigVerify`.
+
+### 6c. Endereço do patch no kernel (bypass de verificação de assinatura RSA)
+
+```asm
+kernel_rsa_patch_address:
+    .long 0x80000300, 0x0007BFDC   # instrução 'bl XeCryptBnQwBeSigVerify' em XexpVerifyXexHeaders
+```
+
+Similar ao 6b, mas no kernel: o Stage 4 sobrescreve a instrução `bl XeCryptBnQwBeSigVerify` dentro de `XexpVerifyXexHeaders` com `li r3, 1`, desabilitando a verificação de assinatura de XEX. Para localizar: no binário do kernel, encontrar `XexpVerifyXexHeaders` (exportada) e identificar o `bl` para `XeCryptBnQwBeSigVerify`.
+
+### 6d. Dados limpos do último segmento do HV (`Stage4_CleanHvData_Retail_17559.bin`)
+
+```asm
+hv_restore_data_address:
+    .long 0x80000106, 0x00030000   # endereço físico do último segmento do HV (0x10000 bytes)
+    
+hypervisor_restore_data:
+    .incbin "Stage4_CleanHvData_Retail_17559.bin"  # 0x10000 bytes limpos desse segmento
+```
+
+O exploit corrompe o último segmento do hypervisor (0x10000 bytes) durante a fase de race condition. O Stage 4 precisa restaurá-lo antes de patchear. Para um kernel diferente:
+1. Extrair o binário do hypervisor da atualização
+2. Identificar o offset do último segmento (0x10000 bytes)
+3. Extrair esses bytes e salvar como `Stage4_CleanHvData_Retail_<versão>.bin`
+4. Verificar se o endereço físico `0x80000106_00030000` ainda é correto para a nova versão
+
+**Dificuldade:** Muito alta — requer acesso e análise do binário do hypervisor, que é criptografado e verificado por assinatura. Ferramentas da comunidade (xbdecompress, free60 tools) são necessárias.
+
+---
+
+## O que NÃO precisa mudar
+
+| Componente | Motivo |
+|---|---|
+| Lógica da ROP chain (Stage 1 e Stage 2) | O algoritmo é abstrato; apenas os endereços dos gadgets mudam |
+| Algoritmo de race condition (Stage 3) | A lógica do loop de corrida é idêntica entre versões |
+| Algoritmo do payload do HV (Stage 4) | A estrutura do patch RSA é a mesma; só os endereços mudam |
+| Gadgets.asm (macros) | As macros são abstrações; os endereços concretos estão no KernelConfig |
+| BadUpdateExploit_Data.asm | Independente de versão de kernel |
+| Endereços do game-specific config (TonyHawk.asm) | São endereços dentro do binário do jogo, não do kernel |
+
+---
+
+## Mudanças no código-fonte necessárias
+
+### 1. Criar `Common/KernelConfig_Retail_<versão>.asm`
+
+Copiar `KernelConfig_Retail_17559.asm` e preencher todos os campos com os novos endereços para a versão alvo. O template vazio já existe em `Common/KernelConfig_Debug.asm`.
+
+### 2. Atualizar `Common/BuildConfig.asm`
+
+Adicionar uma nova flag de build para a versão e um `.ifdef` correspondente:
+
+```asm
+# Antes (só 17559):
+.ifdef RETAIL_BUILD
+    .include "KernelConfig_Retail_17559.asm"
+.else
+    .include "KernelConfig_Debug.asm"
+.endif
+
+# Depois (multi-versão):
+.ifdef KRNL_17559
+    .include "KernelConfig_Retail_17559.asm"
+.elseif KRNL_17544    # exemplo de outra versão
+    .include "KernelConfig_Retail_17544.asm"
+.elseif KRNL_17489
+    .include "KernelConfig_Retail_17489.asm"
+.else
+    .include "KernelConfig_Debug.asm"
+.endif
+```
+
+### 3. Atualizar `Stage4/BadUpdateExploit-4thStage.asm`
+
+Adicionar blocos `.ifdef KRNL_<versão>` para os endereços e o `.incbin` do Stage 4:
+
+```asm
+.ifdef KRNL_17559
+
+hv_rsa_patch_address:
+    .long 0x80000104, 0x00029B04
+kernel_rsa_patch_address:
+    .long 0x80000300, 0x0007BFDC
+...
+    .incbin "Stage4_CleanHvData_Retail_17559.bin"
+
+.elseif KRNL_17544
+
+hv_rsa_patch_address:
+    .long 0x80000104, 0x0002XXXX   # endereço do patch no HV para 17544
+...
+    .incbin "Stage4_CleanHvData_Retail_17544.bin"
+
+.endif
+```
+
+E os endereços de funções internas do HV:
+
+```asm
+.ifdef KRNL_17559
+    .set HvpRelocateCacheLines, 0x00000E14
+    .set HvpSetRMCI,            0x00000398
+.elseif KRNL_17544
+    .set HvpRelocateCacheLines, 0x0000XXXX
+    .set HvpSetRMCI,            0x0000XXXX
+.endif
+```
+
+### 4. Atualizar `build_exploit.bat`
+
+Adicionar suporte ao parâmetro de versão de kernel:
+
+```bat
+:: Exemplo: build_exploit.bat THAW KRNL_17559
+if "%3" == "" (
+    set KRNL_CONFIG=KRNL_17559
+) else (
+    set KRNL_CONFIG=%3
+)
+:: Adicionar --defsym %KRNL_CONFIG%=1 às linhas de compilação
+```
+
+### 5. Fornecer `Stage4_CleanHvData_Retail_<versão>.bin`
+
+Um arquivo binário de exatamente 0x10000 bytes extraído do último segmento do hypervisor da versão alvo.
+
+---
+
+## Resumo de dificuldade por categoria
+
+| Categoria | O que muda | Onde localizar | Dificuldade |
+|---|---|---|---|
+| Funções do kernel | ~16 endereços | Disassembly do kernel (símbolos conhecidos) | ★★☆☆☆ |
+| Funções do XAM | ~12 endereços | Export table do XAM.xex por ordinal | ★☆☆☆☆ |
+| Ordinals de syscall | ~7 valores | Wrappers no kernel (`li r0, X; sc`) | ★★☆☆☆ |
+| Gadgets ROP | ~22 endereços | Scanner de padrão de bytes no kernel/XAM | ★★★☆☆ |
+| BootAnimCodePageAddress | 1 endereço | Análise de carga do bootanim.xex | ★★☆☆☆ |
+| Dados do hypervisor | 4 itens + bin | RE do hypervisor criptografado | ★★★★★ |
+
+O item mais crítico e mais difícil é a Categoria 6: os dados do hypervisor. Os outros 5 itens são trabalho de reverse engineering convencional e razoavelmente sistemático. O hypervisor, por ser criptografado e verificado, requer ferramentas especializadas da comunidade Xbox 360 (free60, xbdecompress, ou dumps diretos via hardware) e conhecimento profundo do sistema.
+
+---
+
+## Exemplo de hierarquia de arquivos para suporte multi-kernel
+
+```
+Common/
+    KernelConfig_Retail_17559.asm      ← já existe
+    KernelConfig_Retail_17544.asm      ← a criar
+    KernelConfig_Retail_17489.asm      ← a criar
+    KernelConfig_Retail_17150.asm      ← a criar
+    ...
+Stage4/
+    Stage4_CleanHvData_Retail_17559.bin  ← já existe
+    Stage4_CleanHvData_Retail_17544.bin  ← a criar
+    Stage4_CleanHvData_Retail_17489.bin  ← a criar
+    ...
+```
+
+Cada par `KernelConfig_Retail_<ver>.asm` + `Stage4_CleanHvData_Retail_<ver>.bin` representa um novo kernel suportado. Toda a lógica de código permanece intacta — apenas os dados de endereços mudam.
