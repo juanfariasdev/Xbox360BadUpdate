@@ -100,11 +100,15 @@ XEX2_MAGIC = b"XEX2"
 XEX_OPT_HEADER_EXECUTION_ID = 0x00040006
 
 # Number of bytes to read from a XEX2 file to cover the full header region.
-# Real XEX2 optional header directories are well within 2 KB; 2 KB is ample.
-XEX2_HEADER_READ_SIZE = 0x800          # 2 KB
+# Some packaged XEX2 files place optional header blocks farther in, so read more.
+XEX2_HEADER_READ_SIZE = 0x4000          # 16 KB
 
 # Real XEX2 files have far fewer optional headers; 256 rules out noise/corrupt data.
 MAX_REASONABLE_OPT_HEADERS = 256
+
+# Cap on the byte length we'll extract for a single XEX2 blob when scanning
+# container files (STFS/PIRS/LIVE/CON). Real system XEX2 files are a few MB.
+MAX_XEX2_EXTRACT_SIZE = 0x02000000  # 32 MB
 
 
 def _read_u32be(data: bytes, offset: int) -> int:
@@ -147,12 +151,91 @@ def parse_xex2_header(data: bytes) -> dict | None:
     }
 
     exec_id_key = XEX_OPT_HEADER_EXECUTION_ID
-    if exec_id_key in opt_headers:
-        exec_id_off = opt_headers[exec_id_key]
-        if exec_id_off + 8 <= len(data):
+    exec_id_off = None
+    for key, val in opt_headers.items():
+        if (key & 0xFFFFFF) == exec_id_key:
+            exec_id_off = val
+            break
+    if exec_id_off is not None:
+        if exec_id_off + 0x14 <= len(data):
             block_size_dwords = _read_u32be(data, exec_id_off)
-            data_off = exec_id_off + 4
-            if data_off + 0x14 <= len(data) and block_size_dwords >= 5:
+            if block_size_dwords == 0:
+                data_off = exec_id_off
+            else:
+                data_off = exec_id_off + 4
+
+            if data_off + 0x14 <= len(data):
+                media_id = _read_u32be(data, data_off + 0x00)
+                version_raw = _read_u32be(data, data_off + 0x04)
+                title_id = _read_u32be(data, data_off + 0x0C)
+
+                major = (version_raw >> 28) & 0xF
+                minor = (version_raw >> 24) & 0xF
+                build = (version_raw >> 8) & 0xFFFF
+                qfe = version_raw & 0xFF
+
+                result["version"] = {
+                    "major": major,
+                    "minor": minor,
+                    "build": build,
+                    "qfe": qfe,
+                    "raw": version_raw,
+                }
+                result["title_id"] = title_id
+                result["media_id"] = media_id
+
+    return result
+
+
+def parse_xex2_header_at(data: bytes, base: int) -> dict | None:
+    """Parse a XEX2 header at *base* inside *data*. Returns a dict or None."""
+    if base + 0x20 > len(data):
+        return None
+    if data[base: base + 4] != XEX2_MAGIC:
+        return None
+
+    module_flags = _read_u32be(data, base + 0x04)
+    pe_image_offset = _read_u32be(data, base + 0x08)
+    opt_count = _read_u32be(data, base + 0x14)
+
+    if opt_count > MAX_REASONABLE_OPT_HEADERS:
+        return None
+
+    opt_headers: dict[int, int] = {}
+    dir_base = base + 0x18
+    for i in range(opt_count):
+        entry_off = dir_base + i * 8
+        if entry_off + 8 > len(data):
+            break
+        key = _read_u32be(data, entry_off)
+        val = _read_u32be(data, entry_off + 4)
+        opt_headers[key] = val
+
+    result: dict = {
+        "offset": base,
+        "module_flags": module_flags,
+        "pe_image_offset": pe_image_offset,
+        "opt_headers": opt_headers,
+        "version": None,
+        "title_id": None,
+        "media_id": None,
+    }
+
+    exec_id_key = XEX_OPT_HEADER_EXECUTION_ID
+    exec_id_off = None
+    for key, val in opt_headers.items():
+        if (key & 0xFFFFFF) == exec_id_key:
+            exec_id_off = base + val
+            break
+    if exec_id_off is not None:
+        if exec_id_off + 0x14 <= len(data):
+            block_size_dwords = _read_u32be(data, exec_id_off)
+            if block_size_dwords == 0:
+                data_off = exec_id_off
+            else:
+                data_off = exec_id_off + 4
+
+            if data_off + 0x14 <= len(data):
                 media_id = _read_u32be(data, data_off + 0x00)
                 version_raw = _read_u32be(data, data_off + 0x04)
                 title_id = _read_u32be(data, data_off + 0x0C)
@@ -211,6 +294,106 @@ def find_xex2_files(directory: str) -> list[tuple[str, str]]:
     return results
 
 
+def find_xex2_offsets(data: bytes) -> list[int]:
+    """Return all byte offsets where a XEX2 magic string appears."""
+    offsets: list[int] = []
+    start = 0
+    while True:
+        pos = data.find(XEX2_MAGIC, start)
+        if pos == -1:
+            break
+        offsets.append(pos)
+        start = pos + 4
+    return offsets
+
+
+def extract_xex2_blob(data: bytes, base: int, out_dir: str) -> str:
+    """Extract a raw XEX2 blob starting at *base* to *out_dir*.
+    Returns the written file path."""
+    next_pos = data.find(XEX2_MAGIC, base + 4)
+    if next_pos == -1 or (next_pos - base) > MAX_XEX2_EXTRACT_SIZE:
+        end = min(base + MAX_XEX2_EXTRACT_SIZE, len(data))
+    else:
+        end = next_pos
+
+    name = f"xex2_offset_0x{base:08X}.xex"
+    path = os.path.join(out_dir, name)
+    with open(path, "wb") as fh:
+        fh.write(data[base:end])
+    return path
+
+
+def _is_printable_ascii(data: bytes) -> bool:
+    return all((32 <= b <= 126) or b == 0 for b in data)
+
+
+def parse_stfs_entries(data: bytes, start: int = 0xC000, end: int = 0x10000) -> list[dict]:
+    """Heuristically parse STFS file entries from the header region.
+    This is a best-effort parser that works for common PIRS/LIVE/CON updates."""
+    entries: list[dict] = []
+    for off in range(start, min(end, len(data) - 0x40), 0x40):
+        entry = data[off:off + 0x40]
+        name_raw = entry[:0x28]
+        if not _is_printable_ascii(name_raw):
+            continue
+        name = name_raw.split(b"\x00", 1)[0]
+        if not name:
+            continue
+        try:
+            name_str = name.decode("ascii")
+        except UnicodeDecodeError:
+            continue
+
+        size = int.from_bytes(entry[0x28:0x2B], "little")
+        # STFS file entries store the start block as 3 bytes (big-endian) at 0x2D..0x2F
+        start_block = int.from_bytes(entry[0x2D:0x30], "big")
+        entries.append({
+            "name": name_str,
+            "offset": off,
+            "size": size,
+            "start_block": start_block,
+        })
+    return entries
+
+
+def stfs_block_to_offset(block: int, data_base: int = 0xB000) -> int:
+    """Approximate STFS block-to-offset mapping.
+    Assumes 0x1000 block size and one hash table every 0xAA data blocks.
+    """
+    b = block + (block // 0xAA) + 1
+    return data_base + b * 0x1000
+
+
+def extract_stfs_file(data: bytes, entry: dict, out_dir: str, data_base: int = 0xB000) -> str:
+    """Extract a file from a STFS container using a contiguous-block heuristic."""
+    name = entry["name"].replace("$", "")
+    size = entry["size"]
+    start_block = entry["start_block"]
+    out_path = os.path.join(out_dir, name)
+
+    if size <= 0:
+        raise ValueError(f"Invalid size for {entry['name']}: {size}")
+    if size > len(data):
+        raise ValueError(f"Unreasonable size for {entry['name']}: {size}")
+
+    remaining = size
+    block = start_block
+    with open(out_path, "wb") as fh:
+        while remaining > 0:
+            off = stfs_block_to_offset(block, data_base)
+            if off >= len(data):
+                break
+            chunk = data[off:off + 0x1000]
+            take = min(remaining, len(chunk))
+            fh.write(chunk[:take])
+            remaining -= take
+            block += 1
+
+    if remaining > 0:
+        raise ValueError(f"Extraction incomplete for {entry['name']}: {remaining} bytes left")
+    return out_path
+
+
 # ---------------------------------------------------------------------------
 # Reporting helpers
 # ---------------------------------------------------------------------------
@@ -248,8 +431,16 @@ def main() -> int:
     parser.add_argument(
         "path",
         help=(
-            "Path to the $SystemUpdate directory, or a single XEX2 file "
-            "(e.g., xboxkrnl.exe)"
+            "Path to the $SystemUpdate directory, a single XEX2 file "
+            "(e.g., xboxkrnl.exe), or a container update file (PIRS/LIVE/CON)"
+        ),
+    )
+    parser.add_argument(
+        "--extract-dir",
+        default="update_extracted",
+        help=(
+            "Directory to extract XEX2 blobs when scanning a container file "
+            "(default: update_extracted/)"
         ),
     )
     args = parser.parse_args()
@@ -267,7 +458,63 @@ def main() -> int:
     # ------------------------------------------------------------------
     if is_file:
         filename_lower = os.path.basename(input_path).lower()
-        xex_files = [(filename_lower, input_path)]
+        try:
+            with open(input_path, "rb") as fh:
+                magic = fh.read(4)
+        except OSError:
+            magic = b""
+
+        if magic == XEX2_MAGIC:
+            xex_files = [(filename_lower, input_path)]
+        else:
+            # Container update file (STFS/PIRS/LIVE/CON) or unknown wrapper.
+            print(f"[*] Scanning container file: {input_path}")
+            try:
+                data = Path(input_path).read_bytes()
+            except OSError as exc:
+                print(f"[!] Cannot read file: {exc}")
+                return 1
+
+            xex_offsets = find_xex2_offsets(data)
+            print(f"    Found {len(xex_offsets)} XEX2 magic occurrence(s)")
+            if not xex_offsets:
+                print("[!] No XEX2 files found inside the container.")
+                return 1
+
+            os.makedirs(args.extract_dir, exist_ok=True)
+            xex_files = []
+
+            # 1) Best-effort STFS file entry extraction for named $flash_*.xex
+            stfs_entries = parse_stfs_entries(data)
+            wanted_names = {
+                "$flash_xam.xex",
+                "$flash_bootanim.xex",
+                "xboxkrnl.exe",
+                "$flash_xboxkrnl.exe",
+            }
+            extracted_named = []
+            for entry in stfs_entries:
+                if entry["name"] in wanted_names:
+                    try:
+                        out_path = extract_stfs_file(data, entry, args.extract_dir)
+                    except ValueError as exc:
+                        print(f"    [!] Skipped {entry['name']}: {exc}")
+                        continue
+                    extracted_named.append(out_path)
+                    xex_files.append((os.path.basename(out_path).lower(), out_path))
+
+            if extracted_named:
+                print("    Extracted named STFS entries:")
+                for p in extracted_named:
+                    print(f"      {p}")
+
+            # 2) Fallback: extract raw XEX2 blobs by scanning magic offsets
+            for pos in xex_offsets:
+                hdr = parse_xex2_header_at(data, pos)
+                if hdr is None:
+                    continue
+                out_path = extract_xex2_blob(data, pos, args.extract_dir)
+                xex_files.append((os.path.basename(out_path).lower(), out_path))
     else:
         print(f"[*] Scanning directory: {input_path}")
         xex_files = find_xex2_files(input_path)
