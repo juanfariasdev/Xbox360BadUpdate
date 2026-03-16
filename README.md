@@ -1776,14 +1776,16 @@ A resposta curta é: **parcialmente sim, mas algumas informações exigem a CPU 
 
 O dump da NAND contém toda a cadeia de boot do Xbox 360:
 
-| Conteúdo | Formato | Criptografia |
+| Conteúdo | Formato | Chave de criptografia |
 |---|---|---|
-| Bootloaders (1BL–CB–CD–CE/CF/CG) | Cabeçalho proprietário | Assinatura RSA (sem chave de CPU) |
-| Hypervisor (HV) | Binário PPC raw | **Criptografado com CPU key** |
-| `xboxkrnl.exe` (kernel) | XEX2 | **Criptografado com CPU key** |
-| `xam.xex` (dashboard system) | XEX2 | **Criptografado com CPU key** |
-| `bootanim.xex` e outros XEXs | XEX2 | **Criptografado com CPU key** |
+| Bootloaders (1BL–CB–CD–CE/CF/CG) | Cabeçalho proprietário | Assinatura RSA pública + derivação per-console no CB |
+| Hypervisor (HV) | Binário PPC raw embutido nos bootloaders | **Verificação per-console** (derivada da CPU key) |
+| `xboxkrnl.exe` (kernel) | XEX2 | **Retail XEX2 key** — chave pública conhecida ✅ |
+| `xam.xex` (dashboard system) | XEX2 | **Retail XEX2 key** — chave pública conhecida ✅ |
+| `bootanim.xex` e outros XEXs | XEX2 | **Retail XEX2 key** — chave pública conhecida ✅ |
 | Metadados do sistema de arquivos | FATX | Leitura direta |
+
+> **Nota importante:** Os arquivos XEX2 (kernel, XAM, etc.) usam a mesma chave pública de criptografia que os pacotes de atualização oficiais da Microsoft — a **retail XEX2 key**, que é de conhecimento público há mais de 15 anos na comunidade de modding. A CPU key só é necessária para acessar o binário do hypervisor, que é verificado pela cadeia de bootloaders.
 
 ---
 
@@ -1793,53 +1795,61 @@ O dump da NAND contém toda a cadeia de boot do Xbox 360:
 |---|---|---|
 | **Versão do kernel** | Cabeçalho XEX2 (`execution_id`) não é criptografado | Identifica qual `KernelConfig_Retail_<ver>.asm` criar |
 | **Versão dos bootloaders** | Cabeçalho dos bootloaders é legível | Confirma revisão de hardware (Falcon/Jasper/Trinity) |
-| **Binários raw XEX2** | Arquivos extraídos do sistema de arquivos da NAND | Entrada para descriptografia com a CPU key |
+| **Endereços de funções do kernel** | Descriptografar `xboxkrnl.exe` com a retail key | Categoria 1 |
+| **Endereços de funções do XAM** | Descriptografar `xam.xex` com a retail key | Categoria 2 |
+| **Ordinals de syscall** | Análise do `xboxkrnl.exe` descriptografado | Categoria 3 |
+| **Gadgets ROP** | Scan de padrão nos binários descriptografados | Categoria 4 |
+| **BootAnimCodePageAddress** | Análise do `bootanim.xex` descriptografado | Categoria 5 |
 
 ---
 
-## O que NÃO está acessível sem a CPU key
+## O que requer a CPU key (apenas Categoria 6)
 
 | Informação | Por quê | Categoria do port |
 |---|---|---|
-| Endereços de funções do kernel | `xboxkrnl.exe` é criptografado | Categoria 1 |
-| Endereços de funções do XAM | `xam.xex` é criptografado | Categoria 2 |
-| Ordinals de syscall | Estão dentro do kernel (criptografado) | Categoria 3 |
-| Gadgets ROP | Estão no kernel e no XAM (criptografados) | Categoria 4 |
-| `BootAnimCodePageAddress` | Requer análise do `bootanim.xex` descriptografado | Categoria 5 |
-| Funções internas do HV | HV é criptografado com CPU key | Categoria 6 |
-| `Stage4_CleanHvData_*.bin` | Requer HV descriptografado | Categoria 6 |
+| Funções internas do HV | HV é embutido nos bootloaders com proteção per-console | Categoria 6 |
+| `Stage4_CleanHvData_*.bin` | Requer acesso ao HV descriptografado | Categoria 6 |
 
 ---
 
 ## O que é a CPU key e onde ela está
 
-A **CPU key** é uma chave de 128 bits (32 caracteres hexadecimais) gravada permanentemente nos **eFuses do processador**. Ela não está na NAND, não está num arquivo, e não pode ser extraída remotamente.
+A **CPU key** é uma chave de 128 bits (32 caracteres hexadecimais) gravada permanentemente nos **eFuses do processador**. Ela não está na NAND, não está num arquivo, e não pode ser extraída remotamente por meios convencionais.
+
+A CPU key é necessária **apenas para a Categoria 6** (dados internos do hypervisor). Para as Categorias 1–5, você precisa apenas da **retail XEX2 key** (chave pública conhecida) — veja a próxima seção.
 
 **Como obter a CPU key do seu console:**
 
 ```
-Opção A — Console com JTAG ou RGH exploit (necessário):
+Opção A — Via BadUpdate exploit (sem hardware, requer port para sua versão):
+    1. Porte o BadUpdate para a versão do seu kernel (veja abaixo)
+    2. Execute o exploit — ele atinge Ring -1 (hypervisor)
+    3. Um payload XKE personalizado lê os registradores MMIO dos eFuses
+    4. A CPU key é gravada em um arquivo no USB
+    → Veja a seção "Extraindo a CPU key via BadUpdate" abaixo
+
+Opção B — Console com JTAG ou RGH exploit já instalado:
     1. Baixe o xell-reloaded (ou xell-gggggg)
     2. Grave na NAND via JRunner ou nandpro
     3. Ligue o console — o xell-reloaded exibe a CPU key via HDMI e porta UART
     4. Copie os 32 caracteres hexadecimais
 
-Opção B — Console com RGH rodando via JRunner (Windows):
+Opção C — Console com RGH rodando via JRunner (Windows):
     1. Conecte o console via USB (modo programador) com RGH ativo
     2. Abra o JRunner → "Read Nand" → ele lê a CPU key automaticamente
 
-Opção C — Console JTAG com xbdm.xex rodando:
+Opção D — Console JTAG com xbdm.xex rodando:
     1. Conecte via Xenia Developer Kit ou Xbox 360 SDK debug tools
     2. Leia o registro EFUSE_OVERRIDE / XeCryptEfuseRead via kernel debug calls
 ```
 
-> **Importante:** Se o seu console **não** tem JTAG/RGH, você não consegue extrair a CPU key por software. O próprio BadUpdate exploit é o caminho para fazer seu console rodar código não-assinado — você não precisa da CPU key para rodar o exploit, apenas para construir o `KernelConfig` de uma nova versão.
+> **Situação NAND com bad blocks:** Se o seu console tem bad blocks na NAND e não consegue atualizar, mas **funciona normalmente**, o BadUpdate (Opção A acima) é exatamente o caminho. O exploit não requer que a NAND esteja em condições de atualização — ele é executado via save game/avatar item, sem modificar a NAND. Veja a seção "Minha NAND tem bad blocks" abaixo.
 
 ---
 
 ## Ferramenta incluída: `Tools/nand_info.py`
 
-O repositório inclui um script Python que analisa um dump de NAND e extrai as informações disponíveis sem a CPU key:
+O repositório inclui um script Python que analisa um dump de NAND e extrai as informações disponíveis:
 
 ```bash
 # Requer Python 3.10 ou superior
@@ -1908,8 +1918,10 @@ python3 Tools/nand_info.py dump.bin
     │
     └─ Extrai XEX2 brutos → nand_extracted/*.xex
            │
-           ▼  (requer CPU key)
-       xextool -k <CPU_KEY> xex2_offset_*.xex
+           ▼  (retail key — sem CPU key!)
+       xextool -e retail xboxkrnl.exe
+       xextool -e retail xam.xex
+       xextool -e retail bootanim.xex
            │
            ├─ xboxkrnl_dec.bin  → IDA/Ghidra (PPC64 BE)
            │       │
@@ -1924,12 +1936,16 @@ python3 Tools/nand_info.py dump.bin
            │       ├─ Export table (ordinals) → Categoria 2 (XAM functions)
            │       └─ Gadgets ROP            → Categoria 4 (XAM gadgets)
            │
-           └─ hypervisor_dec.bin → IDA/Ghidra (PPC32 BE, no-MMU segment)
+           └─ hypervisor_dec.bin → (requer CPU key) IDA/Ghidra (PPC32 BE, no-MMU)
                    │
                    ├─ HvpRelocateCacheLines → Categoria 6a
                    ├─ HvpSetRMCI           → Categoria 6a
                    ├─ HvpImageSignatureVerification → Categoria 6b (HV RSA patch offset)
                    └─ Últimos 0x10000 bytes do HV → Stage4_CleanHvData_Retail_<ver>.bin
+
+NOTA: Use o pacote de atualização oficial ($SystemUpdate) em vez do dump
+      da NAND quando possível — é mais fácil de obter e não precisa de
+      extração: python3 Tools/update_info.py $SystemUpdate/
 ```
 
 ---
@@ -1951,11 +1967,342 @@ Para dumps de consoles Slim (Trinity/Corona/Winchester) o layout eMMC é diferen
 
 | Ferramenta | Uso | Onde encontrar |
 |---|---|---|
-| **xextool** | Descriptografar XEX2 com CPU key | Compilar do source free60 ou releases da comunidade |
+| **xextool** | Descriptografar XEX2 com a retail key (sem CPU key) | Compilar do source free60 ou releases da comunidade |
 | **xbdecompress** | Descomprimir dados LZX do Xbox 360 | free60 / GITHUB |
 | **JRunner** | Extrair CPU key de console JTAG/RGH via USB | jrunner.codeplex.com (arquivado) / GitHub mirrors |
 | **xell-reloaded** | Obter CPU key via HDMI/UART no console | GitHub: xell-reloaded |
+| **xeBuild** | Criar nova imagem de NAND a partir de CPU key + dump | GitHub: xeBuild (comunidade) |
 | **IDA Pro** | Disassembler para PPC64 BE | Comercial (versão gratuita limitada disponível) |
 | **Ghidra** | Disassembler gratuito com suporte a PPC64 | ghidra.re |
 | **Radare2** | Disassembler open-source | rada.re |
 
+
+---
+
+# Sem a CPU key: usando o pacote de atualização oficial
+
+**Contexto:** O usuário tem um dump da NAND mas não tem a CPU key. Quer portar o exploit para sua versão de kernel. Pode usar o arquivo de atualização oficial do Xbox 360 para extrair os dados necessários?
+
+**Resposta curta: SIM** — para as Categorias 1–5. O pacote de atualização oficial usa a **retail XEX2 key** (chave pública conhecida), não a CPU key.
+
+---
+
+## O que é o pacote de atualização oficial ($SystemUpdate)
+
+A Microsoft distribui atualizações de sistema do Xbox 360 como uma pasta chamada `$SystemUpdate` contendo arquivos XEX2 comuns como `xboxkrnl.exe` e `xam.xex`. Esses mesmos arquivos são instalados na NAND durante uma atualização normal.
+
+**Fontes para obter o pacote da sua versão:**
+- Arquivos de atualização do Xbox 360 são amplamente disponíveis em mirrors da comunidade (xboxunity.net, free60.org, GitHub mirrors)
+- Você também pode extrair o `$SystemUpdate` do próprio dump da NAND usando `Tools/nand_info.py`
+
+---
+
+## A retail XEX2 key — sem CPU key necessária
+
+Todos os arquivos XEX2 no pacote de atualização oficial usam a **retail XEX2 key**, que é uma constante pública conhecida pela comunidade de modding do Xbox 360 há mais de 15 anos. Ela é diferente da CPU key (que é única por console).
+
+O `xextool` suporta descriptografia direta usando a retail key:
+
+```bash
+# Decriptar com a retail key (sem CPU key):
+xextool -e retail xboxkrnl.exe
+xextool -e retail xam.xex
+xextool -e retail bootanim.xex
+```
+
+Isso produz binários PPC64 descriptografados que contêm todas as informações necessárias para as Categorias 1–5.
+
+---
+
+## Ferramenta incluída: `Tools/update_info.py`
+
+O repositório inclui um script Python que analisa um pacote de atualização oficial e gera todos os comandos necessários:
+
+```bash
+# Requer Python 3.10 ou superior
+python3 Tools/update_info.py /caminho/para/$SystemUpdate/
+
+# Ou para um único arquivo:
+python3 Tools/update_info.py xboxkrnl.exe
+```
+
+**O que o script faz:**
+
+1. Escaneia o diretório em busca de arquivos XEX2
+2. Parseia o cabeçalho `execution_id` para detectar a versão do kernel
+3. Identifica cada arquivo (kernel, XAM, bootanim) e para que serve no porting
+4. Gera os comandos `xextool` corretos para cada arquivo
+5. Lista exatamente o que procurar em cada binário após a descriptografia
+6. Indica o nome do `KernelConfig` a criar e os próximos passos
+
+**Exemplo de saída:**
+
+```
+  Detected kernel version : 17559  (0x4497)
+  KernelConfig to create  : Common/KernelConfig_Retail_17559.asm
+
+  ENCRYPTION: NO CPU KEY REQUIRED
+  ─────────────────────────────────
+    Retail key : 20B185A59D28FDF05A249AD90C8B3E2A
+
+  XEXTOOL COMMANDS (decrypt with retail key)
+  ────────────────────────────────────────────
+    # Xbox 360 Kernel  →  Category 1, Category 3, Category 4, Category 5 (partial)
+    xextool -e retail "xboxkrnl.exe" -o "xboxkrnl_dec.bin"
+
+    # Xbox Application Manager  →  Category 2, Category 4
+    xextool -e retail "xam.xex" -o "xam_dec.bin"
+
+    # Boot Animation XEX  →  Category 5
+    xextool -e retail "bootanim.xex" -o "bootanim_dec.bin"
+```
+
+---
+
+## Tabela: o que cada arquivo fornece para o port
+
+| Arquivo | Descriptografia | Categorias cobertas |
+|---|---|---|
+| `xboxkrnl.exe` | Retail key (sem CPU key) | 1 (kernel functions), 3 (syscalls), 4 (kernel gadgets), 5 (bootanim page) |
+| `xam.xex` | Retail key (sem CPU key) | 2 (XAM functions), 4 (XAM gadgets) |
+| `bootanim.xex` | Retail key (sem CPU key) | 5 (BootAnimCodePageAddress) |
+| HV binary (em NAND) | **CPU key** (per-console) | 6 (HV functions, RSA patch offsets, CleanHvData) |
+
+Com o pacote de atualização e a retail key, você cobre **5 das 6 categorias** sem precisar da CPU key.
+
+---
+
+# Minha NAND tem bad blocks — qual é o plano?
+
+**Situação:** A NAND tem bad blocks. O console **funciona normalmente** (joga, acessa dashboard, etc.) mas a atualização de sistema falha. O objetivo é extrair a CPU key via BadUpdate para criar uma nova imagem de NAND limpa.
+
+**Boa notícia:** o BadUpdate é um exploit de **software puro** que não modifica a NAND e não requer que o console esteja em condições de atualização. Ele roda via save game do Tony Hawk's American Wasteland (ou item de avatar no ABadAvatar) — se o console funciona normalmente, o exploit pode rodar.
+
+---
+
+## Plano geral
+
+```
+Passo 1 — Identificar a versão de kernel atual
+    │
+    ├─ Se você tem o dump da NAND:
+    │      python3 Tools/nand_info.py dump.bin
+    │      → Detecta a versão do kernel
+    │
+    └─ Se você não tem o dump:
+           Vá em: Sistema → Informações do console → Versão do kernel
+
+Passo 2 — Obter o pacote de atualização para a sua versão
+    │
+    └─ Baixe o $SystemUpdate da sua versão dos mirrors da comunidade
+       python3 Tools/update_info.py $SystemUpdate/
+       → Confirma a versão e gera os comandos de descriptografia
+
+Passo 3 — Descriptografar os binários com a retail key (sem CPU key!)
+    │
+    ├─ xextool -e retail xboxkrnl.exe  → xboxkrnl_dec.bin
+    ├─ xextool -e retail xam.xex       → xam_dec.bin
+    └─ xextool -e retail bootanim.xex  → bootanim_dec.bin
+
+Passo 4 — Disassembler (IDA Pro / Ghidra, PPC64 BE)
+    │
+    ├─ Encontrar todos os endereços das Categorias 1–5
+    └─ Criar Common/KernelConfig_Retail_<sua_versão>.asm
+
+Passo 5 — Construir e rodar o exploit
+    │
+    ├─ Atualizar Common/BuildConfig.asm, Stage4/BadUpdateExploit-4thStage.asm
+    ├─ Executar build_exploit.bat (para a sua versão de kernel)
+    └─ Rodar o exploit no console
+
+Passo 6 — Extrair a CPU key via exploit
+    │
+    ├─ Após Stage 4 (Ring -1), o kernel/HV está patcheado para rodar código não-assinado
+    └─ Um XKE payload personalizado lê os registradores eFuse e grava a CPU key em USB
+       → Veja a seção "Extraindo a CPU key via BadUpdate" abaixo
+
+Passo 7 — Criar nova imagem de NAND
+    │
+    ├─ Use xeBuild GUI ou CLI com a CPU key e o dump original
+    ├─ xeBuild gera uma nova imagem de NAND limpa (sem bad blocks marcados)
+    └─ Flash da nova imagem via programador (nandpro / JRunner / hardware)
+```
+
+---
+
+## Por que o bad block não impede o exploit?
+
+O exploit não faz `XeUpdateSystemSoftware()` real. Ele usa o processo de atualização apenas como vetor de entrada para corromper o contexto do decoder LZX (Stage 3 — race condition). A NAND não precisa estar em condições de receber uma atualização; o console só precisa conseguir **processar** o arquivo de atualização na memória RAM.
+
+---
+
+# Extraindo a CPU key via BadUpdate
+
+**Contexto:** Após executar o BadUpdate com sucesso, o Stage 4 alcança Ring -1 (execução de código no hypervisor) e patcha o HV e o kernel para aceitar código não-assinado. Neste ponto, é possível ler os eFuses do processador, que contêm a CPU key.
+
+---
+
+## Onde está a CPU key no hardware
+
+A CPU key de 128 bits (16 bytes) está gravada nos **eFuses do processador Xenon/Zephyr/Falcon/Jasper** do Xbox 360. Os eFuses são acessados via MMIO (Memory-Mapped I/O) a partir do hypervisor:
+
+```
+Endereço físico do controlador de eFuse: 0x8000020000EF0000
+Registrador de seleção de linha:         0x8000020000EF0210
+Registrador de dados (leitura):          0x8000020000EF0218
+
+Layout dos eFuses relevantes (cada linha tem 64 bits):
+  Linha 0  — hash do lockdown (não é a CPU key)
+  Linha 1  — região/proteção de boot
+  Linha 2  — primeiros 64 bits da CPU key
+  Linha 3  — últimos 64 bits da CPU key
+  Linhas 4–7 — outros dados (FCRT hash, etc.)
+```
+
+Para ler a CPU key, basta ler 16 bytes dos eFuses (linhas 2 e 3).
+
+---
+
+## Abordagem 1: Payload XKE personalizado (pós-exploit)
+
+Após o BadUpdate patchar o kernel para aceitar código não-assinado (Stage 4), você pode criar um `xke_update.bin` personalizado que:
+
+1. Usa `MmMapIoSpace()` para mapear a região MMIO dos eFuses
+2. Lê 16 bytes das linhas 2 e 3
+3. Grava os 32 caracteres hexadecimais num arquivo `/Usb0/cpu_key.txt` no USB
+
+Esqueleto conceitual em pseudocódigo PowerPC:
+
+```asm
+# Mapear o controlador de eFuse (endereço físico 0x8000020000EF0000)
+# via MmMapIoSpace (Category 1 — endereço a resolver do kernel descriptografado)
+li      %r3, EFUSE_PHYS_ADDR_HI
+li      %r4, EFUSE_PHYS_ADDR_LO
+li      %r5, 0x1000             # tamanho a mapear
+bl      MmMapIoSpace            # retorna VA mapeado em r3
+
+# Ler linha 2 (primeiros 8 bytes da CPU key)
+# Escrever índice de linha no registrador de seleção
+li      %r6, 2                  # linha 2
+stw     %r6, 0x210(%r3)
+eieio
+ld      %r7, 0x218(%r3)         # ler 64 bits
+
+# Ler linha 3 (últimos 8 bytes da CPU key)
+li      %r6, 3                  # linha 3
+stw     %r6, 0x210(%r3)
+eieio
+ld      %r8, 0x218(%r3)         # ler 64 bits
+
+# r7:r8 agora contém a CPU key de 128 bits
+# Gravar em arquivo USB via NtCreateFile + NtWriteFile
+```
+
+> **Nota:** O `xke_update.bin` padrão do repositório não implementa a leitura de eFuses. Você precisará desenvolver um payload personalizado ou adaptar um payload existente da comunidade (como os payloads de extração usados no xell-reloaded).
+
+---
+
+## Abordagem 2: Extensão direta do Stage 4
+
+Alternativamente, o Stage 4 (`BadUpdateExploit-4thStage.asm`) pode ser estendido para ler os eFuses no próprio shellcode do hypervisor e escrever a CPU key num endereço de memória fixo, para que o Stage 3 ou o payload posterior possa lê-la.
+
+O Stage 4 já tem acesso total ao hardware. Adicionar ao final do shellcode existente:
+
+```asm
+# Ler CPU key dos eFuses (executa em Ring -1 — acesso direto ao hardware)
+lis     %r10, 0x8000
+ori     %r10, %r10, 0x0200
+rldicr  %r10, %r10, 32, 31
+oris    %r10, %r10, 0x00EF
+ori     %r10, %r10, 0x0000     # 0x80000200.00EF0000 = base do eFuse controller
+
+# Linha 2 — primeiros 64 bits da CPU key
+li      %r11, 2
+stw     %r11, 0x210(%r10)      # selecionar linha 2
+eieio
+ld      %r11, 0x218(%r10)      # ler 64 bits
+
+# Linha 3 — últimos 64 bits da CPU key
+li      %r12, 3
+stw     %r12, 0x210(%r10)      # selecionar linha 3
+eieio
+ld      %r12, 0x218(%r10)      # ler 64 bits
+
+# Guardar em endereço fixo para leitura posterior
+lis     %r9, 0x8000
+ori     %r9, %r9, 0x0300       # exemplo: 0x80000300.00000000 (RAM livre)
+rldicr  %r9, %r9, 32, 31
+std     %r11, 0(%r9)           # primeiros 8 bytes da CPU key
+std     %r12, 8(%r9)           # últimos 8 bytes da CPU key
+```
+
+> **Nota:** Os endereços exatos dos eFuses e da RAM livre variam por revisão de hardware e versão de kernel. Os valores acima são indicativos. Consulte a documentação do free60 para os offsets específicos da sua revisão.
+
+---
+
+## Abordagem 3: Usar o payload do xell-reloaded como XKE
+
+O xell-reloaded implementa leitura de eFuses e exibe a CPU key via HDMI. Partes do seu código de leitura de eFuses podem ser adaptadas como um payload XKE que grava a CPU key num arquivo USB em vez de exibir na tela.
+
+---
+
+# Recriando a NAND com bad blocks usando a CPU key
+
+Com a CPU key em mãos, você pode criar uma nova imagem de NAND limpa usando o **xeBuild**.
+
+---
+
+## Workflow com xeBuild
+
+```bash
+# 1. Obter o pacote de atualização oficial para a sua versão de kernel
+#    (o mesmo que você usou para portar o exploit)
+
+# 2. Usar o xeBuild GUI (Windows) ou CLI:
+xeBuild.exe --console <tipo> --version <versão> --cpukey <cpu_key_hex> \
+            --input dump_original.bin --output nand_nova.bin
+
+# Onde:
+#   <tipo>       = fat / jasper / trinity / corona / winchester
+#   <versão>     = a versão alvo (ex: 17559) — pode ser a mesma ou uma versão mais nova
+#   <cpu_key_hex> = os 32 caracteres hexadecimais da CPU key
+```
+
+O xeBuild gera uma imagem de NAND que:
+- Não tem bad blocks marcados (imagem limpa)
+- Contém os bootloaders atualizados para a versão desejada
+- Está encriptada com sua CPU key (como qualquer NAND original)
+
+---
+
+## Flashando a nova NAND
+
+Após gerar a imagem limpa, use um programador para flashar:
+
+| Ferramenta | Conexão | Notas |
+|---|---|---|
+| **JRunner** (Windows) | USB (modo NAND writer) | Mais fácil; suporta a maioria dos consoles |
+| **nandpro** | LPT / USB (hardware externo) | Tradicional; suporta todos os consoles |
+| **Clip-on NAND programmer** | Diretamente no chip NAND | Para casos onde o console não inicializa |
+
+> **Cuidado:** Sempre faça um dump (backup) da NAND original antes de flashar. Mesmo com bad blocks, o dump pode conter dados recuperáveis. Use `JRunner → Read Nand` ou `nandpro` para criar o backup.
+
+---
+
+## Resumo do fluxo completo para NAND com bad blocks
+
+| Passo | Ferramenta | Requer CPU key? |
+|---|---|---|
+| 1. Identificar versão do kernel | `nand_info.py` | ❌ |
+| 2. Obter pacote de atualização | Download manual | ❌ |
+| 3. Gerar comandos de descriptografia | `update_info.py` | ❌ |
+| 4. Descriptografar xboxkrnl.exe e xam.xex | `xextool -e retail` | ❌ |
+| 5. Encontrar endereços (Categorias 1–5) | IDA Pro / Ghidra | ❌ |
+| 6. Encontrar dados do HV (Categoria 6) | IDA Pro / Ghidra | ✅ (ou pular para passo 8) |
+| 7. Compilar o exploit | `build_exploit.bat` | ❌ |
+| 8. Executar o exploit no console | USB + save game | ❌ |
+| 9. Payload XKE lê CPU key dos eFuses | payload customizado | ❌ (lê diretamente do HW) |
+| 10. Criar nova imagem de NAND | `xeBuild` | ✅ |
+| 11. Flashar nova NAND | JRunner / nandpro | ❌ |
+
+> **Nota sobre o passo 6:** Para uma primeira execução, você pode pular a Categoria 6 completamente e usar os dados do kernel 17559 como ponto de partida para testes. Se a versão for próxima de 17559, muitos offsets podem ser idênticos ou similares. O importante é executar o exploit com sucesso para extrair a CPU key — depois disso, você pode revisitar a Categoria 6 com os dados corretos.

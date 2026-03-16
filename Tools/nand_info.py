@@ -9,23 +9,34 @@ different kernel version, starting from a raw NAND dump (.bin file).
 Usage:
     python3 nand_info.py <nand_dump.bin> [-o <output_dir>]
 
-What it can do without the CPU key:
+What it can do WITHOUT the CPU key:
   - Detect the kernel version from bootloader and XEX2 headers
-  - Locate and extract raw (encrypted) kernel and XAM XEX2 binaries
+  - Locate and extract raw kernel (xboxkrnl.exe) and XAM (xam.xex) XEX2 binaries
 
-What requires the CPU key (see README for full details):
-  - Decrypting the kernel binary to find function addresses
-  - Decrypting the XAM binary to find function addresses
-  - Decrypting the hypervisor binary to find internal function addresses
-    and extract the clean hypervisor data segment
+IMPORTANT — XEX2 files do NOT need the CPU key to decrypt:
+  XEX2 files (xboxkrnl.exe, xam.xex, bootanim.xex, etc.) are encrypted with
+  the well-known RETAIL XEX2 key, which is the same public key used by official
+  Microsoft update packages. The CPU key is NOT required.
 
-The CPU key is stored in the CPU eFuses and is NOT present in the NAND dump.
-To obtain it: boot xell-reloaded on a JTAG/RGH-exploited console and read
-the key from the serial/HDMI output, or use a tool like JRunner.
+  Decrypt with xextool using the retail key:
+      xextool -e retail xboxkrnl.exe
+  (or with explicit key: xextool -k <RETAIL_KEY_HEX> xboxkrnl.exe)
 
-See the README section "Suporte a múltiplas versões de kernel" for the full
-porting guide, and "Extraindo informações a partir de um dump da NAND" for
-the complete extraction workflow.
+  This gives you Categories 1–5 of the portability data without the CPU key.
+  See 'Tools/update_info.py' for a higher-level workflow using official update
+  packages, which are even easier to work with.
+
+What DOES require the CPU key:
+  - Decrypting the HV binary (embedded in bootloaders, per-console protection)
+  - Extracting Stage4_CleanHvData_Retail_<ver>.bin
+  These are Category 6 of the portability data.
+
+  The CPU key is stored in the CPU eFuses and is NOT present in the NAND dump.
+  The easiest way to obtain it is to run the BadUpdate exploit itself, then use
+  the hypervisor-level access to read the eFuse registers.
+
+See the README section "Sem a CPU key: usando o pacote de atualização oficial"
+and "Extraindo a CPU key via BadUpdate" for the complete workflow.
 """
 
 import argparse
@@ -111,6 +122,16 @@ XEX2_MAGIC = b"XEX2"   # 0x58455832
 #                                            where the first DWORD is the block size in DWORDs
 
 XEX_OPT_HEADER_EXECUTION_ID = 0x00040006
+
+# Sanity-check limits used when parsing XEX2 in a raw NAND scan.
+# Real XEX2 files have far fewer optional headers; 256 rules out noise.
+MAX_REASONABLE_OPT_HEADERS = 256
+# code_offset in a well-formed XEX2 should be well under 256 MB;
+# values larger than this indicate a false XEX2 magic match.
+MAX_REASONABLE_CODE_OFFSET = 0x10000000      # 256 MB
+# Cap on the byte length we'll extract for a single XEX2 blob;
+# real system XEX2 files (kernel, XAM) are at most a few MB.
+MAX_XEX2_EXTRACT_SIZE = 0x02000000           # 32 MB
 
 # Execution ID block layout (at the offset pointed to by the directory entry):
 #   +0x00  DWORD  media_id
@@ -231,7 +252,7 @@ def parse_xex2_header(data: bytes, base: int) -> dict | None:
     opt_count = _read_u32be(data, base + 0x14)
 
     # Sanity: reject obviously bogus headers
-    if opt_count > 256 or code_offset > 0x10000000:
+    if opt_count > MAX_REASONABLE_OPT_HEADERS or code_offset > MAX_REASONABLE_CODE_OFFSET:
         return None
 
     # Build the optional-header directory
@@ -294,8 +315,8 @@ def extract_xex2(data: bytes, base: int, header: dict, out_dir: str) -> str:
     code_off = header.get("code_offset", 0)
     # Estimate: find next XEX2 magic or use a generous cap
     next_pos = data.find(XEX2_MAGIC, base + 4)
-    if next_pos == -1 or (next_pos - base) > 0x02000000:
-        end = min(base + 0x02000000, len(data))
+    if next_pos == -1 or (next_pos - base) > MAX_XEX2_EXTRACT_SIZE:
+        end = min(base + MAX_XEX2_EXTRACT_SIZE, len(data))
     else:
         end = next_pos
 
@@ -435,35 +456,31 @@ def main() -> int:
         print(f"\n  Extracted {len(parsed_xex2)} XEX2 file(s) → {args.output}/")
 
     print("""
-  What you can do with the extracted raw XEX2 files:
-  ─────────────────────────────────────────────────
+  What you can do with the extracted XEX2 files:
+  ─────────────────────────────────────────────
     • Determine the kernel version (done above if successful)
     • Open in xextool / XeXTract to view the XEX2 header metadata
-    • Decrypt with the CPU key to get the raw PPC64 binary:
+    • Decrypt with the RETAIL XEX2 key (no CPU key needed!):
 
-        xextool -k <CPU_KEY_HEX> xex2_offset_0xXXXXXXXX.xex
+        xextool -e retail xex2_offset_0xXXXXXXXX.xex
+        # or: python3 Tools/update_info.py $SystemUpdate/  (official update package)
 
     • Load the decrypted binary in IDA Pro or Ghidra (PowerPC BE, 64-bit)
       to find the function addresses and ROP gadgets required in KernelConfig
 
-  What requires the CPU key:
-  ─────────────────────────
-    • Decrypting xboxkrnl.exe  → kernel function addresses (Category 1)
-    • Decrypting xam.xex       → XAM function addresses (Category 2)
-    • Decrypting the HV binary → HvpRelocateCacheLines, HvpSetRMCI,
-                                  RSA patch addresses, clean HV data (Category 6)
+  Key clarification — what needs the CPU key vs. the retail key:
+  ─────────────────────────────────────────────────────────────
+    • xboxkrnl.exe + xam.xex → encrypted with RETAIL KEY (public, no CPU key needed)
+    • bootanim.xex and other XEX2 files → same retail key
+    • HV binary (in bootloaders) → CPU-key-derived protection (Category 6 only)
 
-  The CPU key is stored in the CPU eFuses — it is NOT present in the NAND.
-  To obtain your CPU key:
-    1. Your console must already run a JTAG or RGH exploit
-    2. Boot xell-reloaded (or xell-gggggg) — it prints the CPU key on
-       HDMI output and via UART
-    3. Alternatively, use JRunner (Windows) which reads the CPU key from
-       a running RGH/JTAG console via USB
-    4. Record the 32-hex-character CPU key for use with xextool
+  NOTE: If you do not have the CPU key yet, you can still port and run the
+  exploit using only the official $SystemUpdate package for your kernel version.
+  The exploit itself (when run successfully) gives you Ring -1 access that can
+  be used to read the CPU key from the eFuse registers.
 
-  See the README section "Extraindo informações a partir de um dump da NAND"
-  and "Suporte a múltiplas versões de kernel" for the complete porting guide.
+  See the README section "Sem a CPU key: usando o pacote de atualizacao oficial"
+  and "Extraindo a CPU key via BadUpdate" for the complete porting guide.
 """)
     return 0
 
