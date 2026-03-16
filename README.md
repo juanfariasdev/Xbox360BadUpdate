@@ -1275,3 +1275,169 @@ Stage 3 (Ring 0, de volta)
     → LED verde
     → XLaunchNewImage("PAYLOAD:\\BadNyan.xex")
 ```
+
+---
+
+# ABadAvatarHDD — Como funciona e diferenças de código
+
+**Repositório:** https://github.com/rain2591/ABadAvatarHDD-rain2591  
+**Autor:** rain2591  
+**Base:** hex-edit dos binários compilados do ABadAvatar (shutterbug2000)
+
+ABadAvatarHDD é uma modificação de **apenas um campo de dados** do ABadAvatar original: a URL de dispositivo que o exploit usa ao montar o symlink `PAYLOAD:`. Em vez de apontar para o pendrive USB (`\Device\Mass0\`), ele aponta para a **partição 1 do HDD interno** (`\Device\Harddisk0\Partition1\`). Isso significa que todos os arquivos de payload (Stage 2, Stage 3, Stage 4, `update_data.bin`, `xke_update.bin`, `default.xex`) ficam no HD interno do console — **nenhum pendrive é necessário durante a execução**.
+
+> O autor explica explicitamente: *"As i will not be contributing back to the original fork this repository will be updated only as there will not be any code worth sending back to Shutterbugs as i have **hex edited** the payloads as opposed to modifying his source and recompiling it."*
+
+---
+
+## O que muda: a única diferença técnica
+
+### O campo `_hdd_symlink_path_str` em `BadUpdateExploit_Data.asm`
+
+Em `Common/BadUpdateExploit_Data.asm`, o campo que define o destino do symlink `PAYLOAD:` é:
+
+```asm
+_hdd_symlink_path_str:
+    .ifdef DEBUG_BUILD
+        .ascii "\\Device\\Harddisk0\\Partition1\\BadUpdatePayload"
+    .else
+        .ascii "\\Device\\Mass0\\BadUpdatePayload"
+    .endif
+```
+
+O ABadAvatar original compila para **RETAIL_BUILD**, resultando no caminho USB:
+
+```
+\Device\Mass0\BadUpdatePayload          ← 31 bytes (ABadAvatar, USB)
+```
+
+O ABadAvatarHDD troca esse caminho pelo caminho do HD interno:
+
+```
+\Device\Harddisk0\Partition1\BadUpdatePayload  ← 46 bytes (ABadAvatarHDD, HDD)
+```
+
+A equivalência em código fonte seria simplesmente alterar a linha do `RETAIL_BUILD` de:
+
+```asm
+# ABadAvatar (USB)
+.ascii "\\Device\\Mass0\\BadUpdatePayload"
+```
+
+para:
+
+```asm
+# ABadAvatarHDD (HDD interno)
+.ascii "\\Device\\Harddisk0\\Partition1\\BadUpdatePayload"
+```
+
+Como a string HDD é **15 bytes mais longa**, um hex edit simples exige também atualizar os dois campos de comprimento da `UNICODE_STRING` que apontam para essa string (os dois valores `.short hdd_symlink_path_str_length` e `.short hdd_symlink_path_str_length + 1` no `_hdd_symlink_mount` logo abaixo). O autor fez isso manualmente nos binários compilados.
+
+---
+
+## Quais arquivos foram hex-editados
+
+### Arquivos modificados
+
+| Arquivo | O que foi alterado |
+|---|---|
+| `Content/.../E0002FF78DFBDE7B` | Perfil do Avatar (335 KB) — contém Stage 0 e Stage 1 embutidos; `_hdd_symlink_path_str` e campos de comprimento da UNICODE_STRING atualizados |
+| `BU/BadUpdateExploit-2ndStage.bin` | Stage 2 ROP chain (2.1 MB) — segmento de dados do exploit embutido; mesmo campo `_hdd_symlink_path_str` atualizado |
+
+### Arquivos idênticos ao ABadAvatar original
+
+Os seguintes arquivos têm **hash SHA idêntico** ao ABadAvatar de shutterbug2000 — não foram tocados porque não contêm referências a `Mass0` ou `Harddisk0`:
+
+| Arquivo | Motivo para não mudar |
+|---|---|
+| `BU/BadUpdateExploit-3rdStage.bin` | Stage 3 apenas lê de `PAYLOAD:\` (symlink já remapeado) e `Flash:\` |
+| `BU/BadUpdateExploit-4thStage.bin` | Stage 4 é shellcode do hypervisor puro — sem paths de arquivo |
+| `BU/update_data.bin` | Dados LZX puros, sem strings de caminho |
+| `BU/xke_update.bin` | Payload XKE puro, sem strings de caminho |
+
+---
+
+## Por que Stage 3 não precisa de mudança
+
+O symlink `PAYLOAD:` é criado na Stage 1 pela chamada `ObCreateSymbolicLink`. Uma vez criado, ele aponta para `\Device\Harddisk0\Partition1\BadUpdatePayload`. Todas as referências subsequentes a `PAYLOAD:\<arquivo>` — feitas na Stage 2 (para ler Stage 2 si mesmo, Stage 3, Stage 4), Stage 3 (para ler `update_data.bin`, `xke_update.bin`, Stage 4, e o payload final) — usam o symlink abstrato `PAYLOAD:`, que o kernel resolve para o caminho concreto. Como o symlink já aponta para HDD, Stage 3, Stage 4 e todos os dados funcionam sem modificação.
+
+---
+
+## Pacote de payload incluso
+
+O ABadAvatarHDD inclui um pacote completo e pronto para uso:
+
+| Arquivo | Descrição |
+|---|---|
+| `BU/default.xex` | XeUnshackle 1.02 — remove restrições de software e lança Aurora |
+| `BU/XeUnshackleAutoStart.txt` | Contém `0.00` — instrui o XeUnshackle a iniciar automaticamente |
+| `Aurora/` | Aurora Dashboard 0.7b.2 — substituto de dashboard para rodar jogos |
+| `Plugins/` | Proto V2.4 (stealth) e outros plugins |
+| `launch.ini` | Configuração do FreeStyle Dash / Aurora pré-configurada para HDD |
+
+O arquivo `BU/XeUnshackleAutoStart.txt` com conteúdo `0.00` é lido pelo XeUnshackle como indicador de versão/autostart — ele instrui o XeUnshackle a pular a tela de confirmação e aplicar os patches imediatamente, carregando Aurora em seguida.
+
+---
+
+## Diagrama do caminho de armazenamento
+
+```
+ABadAvatar (original / USB):
+  Avatar item na flash
+    → Stage 0 + Stage 1 no item
+    → monta PAYLOAD: → \Device\Mass0\BadUpdatePayload   ← USB pendrive
+    → lê Stage 2 do USB
+    → Stage 2, 3, 4 e payloads ficam no USB
+
+ABadAvatarHDD (HDD interno):
+  Avatar item na flash
+    → Stage 0 + Stage 1 no item (hex-editado)
+    → monta PAYLOAD: → \Device\Harddisk0\Partition1\BadUpdatePayload  ← HDD interno
+    → lê Stage 2 do HDD
+    → Stage 2, 3, 4 e payloads ficam no HDD interno
+```
+
+---
+
+## Tabela de Diferenças de Código: ABadAvatar vs ABadAvatarHDD
+
+| Aspecto | ABadAvatar (shutterbug2000) | ABadAvatarHDD (rain2591) |
+|---|---|---|
+| **Armazenamento dos payloads** | Pendrive USB | HD interno do Xbox 360 |
+| **Método de modificação** | Código fonte compilado | Hex edit dos binários |
+| **`_hdd_symlink_path_str`** | `\Device\Mass0\BadUpdatePayload` | `\Device\Harddisk0\Partition1\BadUpdatePayload` |
+| **Avatar profile** | Aponta para USB | Hex-editado para apontar para HDD |
+| **`BadUpdateExploit-2ndStage.bin`** | Aponta para USB | Hex-editado para apontar para HDD |
+| **`BadUpdateExploit-3rdStage.bin`** | Original | Idêntico (não modificado) |
+| **`BadUpdateExploit-4thStage.bin`** | Original | Idêntico (não modificado) |
+| **`update_data.bin`** | Original | Idêntico (SHA igual) |
+| **`xke_update.bin`** | Original | Idêntico (SHA igual) |
+| **Payload padrão incluso** | `BadNyan.xex` (exemplo) | `default.xex` (XeUnshackle 1.02 → Aurora) |
+| **Pacote completo pronto** | Não | Sim (Aurora + Proto + plugins + launch.ini) |
+| **`XeUnshackleAutoStart.txt`** | Não incluso | `0.00` (auto-start do XeUnshackle) |
+
+---
+
+## Resumo: o que seria necessário para recompilar do zero
+
+Para recriar o ABadAvatarHDD a partir do código fonte, bastaria uma única mudança no arquivo `Common/BadUpdateExploit_Data.asm`:
+
+```asm
+# Antes (ABadAvatar, RETAIL_BUILD):
+_hdd_symlink_path_str:
+    .ifdef DEBUG_BUILD
+        .ascii "\\Device\\Harddisk0\\Partition1\\BadUpdatePayload"
+    .else
+        .ascii "\\Device\\Mass0\\BadUpdatePayload"
+    .endif
+
+# Depois (ABadAvatarHDD, RETAIL_BUILD):
+_hdd_symlink_path_str:
+    .ifdef DEBUG_BUILD
+        .ascii "\\Device\\Harddisk0\\Partition1\\BadUpdatePayload"
+    .else
+        .ascii "\\Device\\Harddisk0\\Partition1\\BadUpdatePayload"
+    .endif
+```
+
+Em outras palavras: usar o mesmo caminho de HDD (`\Device\Harddisk0\Partition1\BadUpdatePayload`) tanto para `DEBUG_BUILD` quanto para `RETAIL_BUILD`, em vez de usar o path do USB no `RETAIL_BUILD`. O assembler recalcularia automaticamente o `hdd_symlink_path_str_length` e todos os endereços do segmento de dados. Nenhum outro arquivo de código fonte precisaria ser alterado.
