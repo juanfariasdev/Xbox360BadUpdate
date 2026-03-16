@@ -879,3 +879,399 @@ Stage 4 (Ring -1) → set LED orange
 Stage 3 (back, Ring 0) → set LED fully green
                        → XLaunchNewImage("PAYLOAD:\\default.xex")
 ```
+
+---
+
+# ABadAvatar — Como funciona e diferenças de código
+
+**Repositório:** https://github.com/shutterbug2000/ABadAvatar  
+**Autor:** shutterbug2000  
+**Base:** fork/port do exploit BadUpdate de grimdoomer
+
+ABadAvatar é uma adaptação do exploit BadUpdate que troca o vetor de ataque inicial: em vez de explorar o save game de um jogo (Tony Hawk's American Wasteland ou Rock Band Blitz), ele explora um **item cosmético de Avatar** armazenado no perfil do usuário na memória flash interna do console. O resultado final é idêntico — execução de código não-assinado no nível do hypervisor — mas o caminho até lá é diferente nas etapas 0 e 1, e há ajustes menores nas etapas 2 e 3.
+
+---
+
+## Visão Geral: Como o ABadAvatar funciona
+
+O Xbox 360 armazena os dados de Avatar do usuário (roupas, itens comprados, etc.) em um arquivo XEX no perfil do usuário na flash interna: `\Device\Flash\GamerProfile.xex`. Quando o usuário acessa a tela de seleção de perfil no dashboard e move o cursor, o sistema carrega e processa os itens de Avatar do perfil destacado. Esse processamento ocorre dentro de uma **XamTask** — uma tarefa do Kernel gerenciada pelo módulo `xam.xex`, com sua própria thread e contexto de memória.
+
+O exploit usa um item de Avatar cuidadosamente construído que contém código de shell comprimido em um campo de dados binários do item. Quando o dashboard processa esse item, ele descomprime e executa o payload embarcado, que realiza um **stack pivot** para uma cadeia ROP também armazenada no arquivo do item. Toda a execução das etapas 0 e 1 acontece dentro dessa XamTask.
+
+A diferença crucial em relação ao BadUpdate original é que:
+- Não é necessário nenhum jogo específico — o exploit funciona diretamente a partir do dashboard, apenas movendo o cursor de seleção de perfil
+- A execução ocorre dentro de uma **XamTask** em vez de um processo de jogo, o que exige uma sequência especial de "saída de XamTask" no final da Stage 2, antes de passar para a Stage 3
+
+---
+
+## Stage 0 — Payload Inicial no Item de Avatar (Ring 3)
+
+### O que é
+
+O Stage 0 não tem um arquivo `.asm` editável separado — é considerado estático e está incorporado diretamente no arquivo de item de Avatar do perfil de release, no offset de arquivo **`0x2200`**. O código é comprimido (dificultando modificações) e tem duas responsabilidades únicas:
+
+1. **Exibir texto anti-golpe** na tela enquanto o exploit inicializa, para que usuários não pensem que o console está quebrando.
+2. **Realizar o stack pivot inicial** que transfere o controle da execução do dashboard para a cadeia ROP da Stage 1.
+
+O Stage 0 é equivalente funcional aos bytes de overflow que, no BadUpdate original, sobrescrevem o registrador `lr` com o endereço do gadget `stack_pivot` (`lwz r1, 0(r1) / lwz r12, -8(r1) / mtlr r12 / blr`). A diferença é que aqui a vulnerabilidade está no processamento do item de Avatar pelo dashboard, e não em um parser de save game de jogo.
+
+### Por que não é modificado
+
+A estrutura do item de Avatar é comprimida de forma não trivial. O Stage 0 somente exibe um texto e faz o pivot — não há razão para modificá-lo. Se você precisar alterar o Stage 1 (que começa em `0x2200` no arquivo do item), a abordagem é um hex-edit direto no arquivo de saída binário.
+
+---
+
+## Stage 1 — Cadeia ROP Inicial no Item de Avatar (Ring 3)
+
+### Como é inserido
+
+Em vez de estar dentro de um save game de THAW/RBB no cartão USB, a Stage 1 do ABadAvatar fica **dentro do próprio arquivo de item de Avatar** no perfil do usuário na flash, a partir do offset `0x2200`. Não existe um arquivo de save game ou cartão USB envolvido para a Stage 1.
+
+O arquivo ASM da Stage 1 (`Stage1/BadUpdateExploit.asm`) é **funcionalmente idêntico** ao do BadUpdate original para THAW. A estrutura completa da cadeia ROP é a mesma:
+
+1. Gadget de transição inicial (`__restgprlr_31`)
+2. `memcpy` para copiar o segmento de dados para uma região gravável
+3. `NtAllocateVirtualMemory` para alocar memória para a Stage 2
+4. `ObCreateSymbolicLink` para montar o drive `PAYLOAD:` apontando para o USB
+5. Leitura do arquivo `BadUpdateExploit-2ndStage.bin` do USB para a memória alocada
+6. Ajuste do endereço da cadeia Stage 2 e configuração do target do stack pivot
+7. Stack pivot para a Stage 2
+
+A única diferença relevante é como o controle chega aqui: não é um overflow de buffer de nome de gap de save game, mas sim a execução do payload descomprimido pelo processador de itens de Avatar.
+
+### Diferença nas strings de symlink
+
+No BadUpdate original (`Common/BadUpdateExploit_Data.asm`), os paths de symlink usam o namespace `\??`:
+
+```asm
+# BadUpdate original
+_hdd_symlink_mount_str:
+    .ascii  "\\??\\PAYLOAD:"
+
+_flash_symlink_mount_str:
+    .ascii  "\\??\\Flash:"
+```
+
+No ABadAvatar (`Common/BadUpdateExploit_Data.asm`), o namespace é `\System??` — necessário porque o código executa dentro de uma XamTask do módulo `xam.xex`, que utiliza um namespace de objeto diferente do namespace de processo de jogo:
+
+```asm
+# ABadAvatar
+_hdd_symlink_mount_str:
+    .ascii  "\\System??\\PAYLOAD:"
+
+_flash_symlink_mount_str:
+    .ascii  "\\System??\\Flash:"
+```
+
+### Diferença no `_second_stage_chain_address`
+
+No BadUpdate original, `_second_stage_chain_address` começa em zero e é preenchido em tempo de execução:
+
+```asm
+# BadUpdate - BadUpdateExploit_Data.asm
+_second_stage_chain_address:
+    .long   0x00000000
+```
+
+No ABadAvatar, esse campo é pré-inicializado com uma constante `second_stage_chain_addressA` definida no arquivo de configuração `Avatar.asm`. Isso é necessário porque o contexto de execução dentro da XamTask tem um endereço de memória fixo e conhecido para onde a Stage 2 é alocada:
+
+```asm
+# ABadAvatar - BadUpdateExploit_Data.asm
+_second_stage_chain_address:
+    .long   second_stage_chain_addressA
+```
+
+### Diferença no `_overwrite_loop_secondary_buffer_address`
+
+No BadUpdate original, este campo começa em zero e é preenchido em runtime:
+
+```asm
+# BadUpdate
+_overwrite_loop_secondary_buffer_address:
+    .long   0x00000000
+```
+
+No ABadAvatar, é pré-inicializado com um endereço hardcoded `overwrite_loop_secondary_buffer_address_hardcoded`. O comentário no código explica:
+
+```asm
+# ABadAvatar
+# If the stack goes too low in XAM, it bugchecks (at least, I think that's
+# what's going on...). So we use a hardcoded higher address.
+_overwrite_loop_secondary_buffer_address:
+    .long   overwrite_loop_secondary_buffer_address_hardcoded
+```
+
+### Estrutura `_new_task_attributes` adicionada
+
+O ABadAvatar acrescenta uma estrutura `_new_task_attributes` no segmento de dados que não existe no BadUpdate original:
+
+```asm
+# ABadAvatar - adicionado
+_new_task_attributes:
+    .long   0xA4280002
+    .long   0x00000005
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+    .long   0x00000000
+```
+
+Essa estrutura é usada na sequência de saída de XamTask no final da Stage 2 (seção `_copy_and_execute_stage_three`), quando a Stage 2 precisa criar uma nova task para executar a Stage 3 fora do contexto da XamTask original.
+
+### `BuildConfig.asm` — novo target `AVATAR`
+
+O arquivo `BuildConfig.asm` do ABadAvatar adiciona suporte ao novo target de jogo/plataforma `AVATAR`:
+
+```asm
+# ABadAvatar - BuildConfig.asm (adicionado)
+.ifdef AVATAR
+    .include "Avatar.asm"
+.endif
+```
+
+O arquivo `Avatar.asm` (não presente no BadUpdate original) define as constantes específicas do contexto de Avatar: `RuntimeDataSegmentAddress`, `BootAnimCodePageAddress` (`0x90110000`), `second_stage_chain_addressA`, `overwrite_loop_secondary_buffer_address_hardcoded`, e outros parâmetros de layout de memória específicos da XamTask.
+
+---
+
+## Stage 2 — Extração de Cipher Text e Injeção da Stage 3 (Ring 3 ROP)
+
+A Stage 2 do ABadAvatar (`Stage2/BadUpdateExploit-2ndStage.asm`) é **estruturalmente quase idêntica** à do BadUpdate original. O mesmo mecanismo de captura de cipher text, o mesmo loop de overwrite, e a mesma macro `MEMCPY_CIPHER_TEXT` estão presentes. As diferenças são:
+
+### 2.1  Target da oracle: `GamerProfile.xex` em vez de `bootanim.xex`
+
+No BadUpdate, a oracle de cipher text usa `bootanim.xex` — o executável da animação de boot armazenado na flash:
+
+```asm
+# BadUpdate - BadUpdateExploit_Data.asm
+_flash_bootanim_path:
+    .ascii  "Flash:\\bootanim.xex"
+```
+
+No ABadAvatar, o target é `GamerProfile.xex` — o próprio executável do sistema de Avatar armazenado na flash:
+
+```asm
+# ABadAvatar - BadUpdateExploit_Data.asm
+_flash_bootanim_path:
+    .ascii  "\\Device\\Flash\\GamerProfile.xex"
+```
+
+**Por que isso importa:** A Stage 2 precisa de um módulo XEX que:
+- Seja carregável via `XexLoadImage`
+- Tenha pelo menos uma página de código com cipher text que possa ser lida como oracle
+- Possa ser carregado e descarregado repetidamente sem travar o sistema
+
+No contexto da XamTask do Avatar, `GamerProfile.xex` é o módulo adequado. `bootanim.xex` não é acessível ou confiável nesse contexto de execução.
+
+O mecanismo permanece idêntico: carrega o módulo, obtém o endereço físico da página de código com `MmGetPhysicalAddress`, copia 16 bytes como plain-text oracle, descarrega o módulo, e então percorre o loop de captura de cipher text.
+
+### 2.2  Endereço de destino para a Stage 3: `0x90110000` em vez de `0x98030000`
+
+A constante `BootAnimCodePageAddress` é definida em `Avatar.asm` como `0x90110000`. Todas as referências a esse endereço na Stage 2 usam essa constante, então a única mudança de código visível é no arquivo de configuração.
+
+No final da Stage 2, a Stage 3 é executada via:
+
+```asm
+# BadUpdate - jump to Stage 3 at 0x98030000
+.long   0x00000000, BootAnimCodePageAddress  # r31 = 0x98030000
+.long   call_func_dispatch
+```
+
+```asm
+# ABadAvatar - jump to Stage 3 at 0x90110000
+.long   0x00000000, BootAnimCodePageAddress  # r31 = 0x90110000
+.long   call_func_dispatch
+```
+
+### 2.3  Sequência de saída de XamTask em `_copy_and_execute_stage_three`
+
+Esta é a diferença mais significativa entre as duas Stage 2. No BadUpdate original, `_copy_and_execute_stage_three` finaliza com simplesmente chamar `BootAnimCodePageAddress` (Stage 3) via `call_func_dispatch`. No ABadAvatar, **antes de chamar a Stage 3**, existe uma longa sequência de gadgets que realiza uma "saída limpa da XamTask" e criação de uma nova task.
+
+**Por que é necessário:** No BadUpdate, a Stage 2 executa dentro de um processo de jogo. Ao final, simplesmente chama o endereço de memória da Stage 3 como uma função. No ABadAvatar, a Stage 2 executa dentro de uma XamTask gerenciada pelo `xam.xex`. Se a Stage 3 for chamada diretamente sem limpar a XamTask, o sistema pode travar ou ter comportamento indefinido ao tentar retornar. A sequência de saída replica o que uma XamTask normalmente faz ao encerrar.
+
+A sequência de saída (comentada no código como "I know it's messy and uncommented, but I'll clean it up later. Maybe.") inclui:
+
+```asm
+# ABadAvatar - _copy_and_execute_stage_three (sequência de saída de XamTask)
+
+# 1. Chama 0x81a72b34 com ponteiro para estrutura interna da XamTask (0x81b4af5c)
+#    para desregistrar a task do scheduler
+CALL_FUNC 11, 0x81a72b34, R3H=0xffffffff, R3L=0x81b4af5c, R4H=0, R4L=0
+# ... armazena valor de retorno em 0x81b4af60
+
+# 2. Chama 0x81964c78 (função de cleanup de task) com o handle armazenado
+CALL_FUNC 1, 0x81964c78, R3H=0, R3L=0x41414141, ...
+
+# 3. Zera bytes de estado em 0x43D9A290
+CALL_FUNC 11, memset, R3H=0, R3L=0x43D9A290, R4H=0, R4L=0, R5H=0, R5L=0x4
+
+# 4. Chama 0x81a72b44 (notificação de término de task)
+CALL_FUNC 1, 0x81a72b44, R3H=0xffffffff, R3L=0x81b4af5c, R4H=0, R4L=0x41414141
+
+# 5. Chama 0x816ba6b0 (cria nova XamTask) com _new_task_attributes
+#    para executar a Stage 3 em uma nova task limpa
+CALL_FUNC 22, 0x816ba6b0, R3H=0, R3L=0x81b4af58, R4H=0, R4L=0x4,
+    R5H=0, R5L=0x0, R6H=0, R6L=0x0, R7H=0, R7L=new_task_attributes
+
+# 6. Suspende a thread atual para dar controle à nova task
+CALL_FUNC 1, 0x800750d0, R3H=0, R3L=1
+
+# ... manipulação adicional de ponteiros e chamadas para agendar a Stage 3
+# como uma nova task independente em 0x90110000
+
+# 7. Finalmente, chama Stage 3 via call_func_dispatch
+.long   0x00000000, BootAnimCodePageAddress  # r31 = 0x90110000
+.long   call_func_dispatch
+```
+
+Os endereços hardcoded (`0x81a72b34`, `0x81a72b44`, `0x816ba6b0`, `0x81964c78`, `0x800750d0`, `0x81725308`, `0x816B9668`, `0x81a722f4`) são endereços de funções internas do `xam.xex` versão 17559, específicos para gerenciamento de XamTasks.
+
+---
+
+## Stage 3 — Ataque de Race Condition: Corrupção do Contexto do Decoder LZX (Ring 0)
+
+### Endereço de carga: `0x90110000` em vez de `0x98030000`
+
+A única mudança obrigatória na Stage 3 é o **endereço onde o binário é carregado em memória**. No BadUpdate:
+
+```asm
+# BadUpdate - Stage3/BadUpdateExploit-3rdStage.asm (via DATA_ADDR macro)
+.macro DATA_ADDR sym
+    .set \sym,  BootAnimCodePageAddress + (_\sym - _start)
+    # BootAnimCodePageAddress = 0x98030000
+.endm
+```
+
+No ABadAvatar:
+
+```asm
+# ABadAvatar - Stage3/BadUpdateExploit-3rdStage.asm (via DATA_ADDR macro)
+.macro DATA_ADDR sym
+    .set \sym,  BootAnimCodePageAddress + (_\sym - _start)
+    # BootAnimCodePageAddress = 0x90110000
+.endm
+```
+
+Todos os endereços de funções e dados pré-calculados nas labels `DATA_ADDR` ficam deslocados por `0x90110000 - 0x98030000 = -0x7F20000` em relação ao BadUpdate.
+
+### Padding obrigatório com `blr` (`4E 80 00 20`)
+
+O README do ABadAvatar instrui:
+
+> Stage 3 should be built at 0x90110000 instead of 0x98030000. Additionally, you should pad up to 0x10000 bytes with `4E 80 00 20` to ensure the module used in the exploit can be properly unloaded.
+
+**Por que é necessário:** A Stage 2 carrega a Stage 3 na mesma página de código de `GamerProfile.xex`. Para que `XexUnloadImage` consiga descarregar o módulo corretamente após a Stage 3 ter sido executada (necessário para a sequência de saída de XamTask), a página de código precisa ter exatamente `0x10000` bytes válidos. O padding com `4E 80 00 20` (`blr`) garante que qualquer tentativa de executar bytes além do final do código real retorne imediatamente, evitando crashes.
+
+### Lógica da race condition: idêntica
+
+A função `main`, `RunUpdatePayloadThreadProc`, `BuildCipherTextLookupTable`, e todos os syscalls (`HvxKeysExecute`, `HvxEncryptedReserveAllocation`, `HvxEncryptedEncryptAllocation`, `HvxEncryptedReleaseAllocation`, `HvxPostOutputExploit`, etc.) são **bit-a-bit idênticos** entre ABadAvatar e BadUpdate. O mesmo ataque de race condition contra o campo `dec_output_buffer` no contexto do decoder LZX, no scratch buffer do HV, é usado.
+
+### Nome do payload de saída
+
+No ABadAvatar, o `XLaunchNewImage` no final de `RunUpdatePayloadThreadProc` usa `PAYLOAD:\\BadNyan.xex` como nome de arquivo de exemplo:
+
+```asm
+# ABadAvatar
+lis   %r11, aPayloadBadnyan@ha
+addi  %r3, %r11, aPayloadBadnyan@l   # "PAYLOAD:\\BadNyan.xex"
+bl    _XLaunchNewImage
+```
+
+No BadUpdate original, o arquivo de destino é `PAYLOAD:\\default.xex`. Ambos são apenas nomes de exemplo — o usuário substitui pelo executável desejado (XeUnshackle, FreeMyXe, etc.).
+
+---
+
+## Stage 4 — Shell Code do Hypervisor (Ring −1): Idêntica
+
+O arquivo `Stage4/BadUpdateExploit-4thStage.asm` do ABadAvatar é **idêntico** ao do BadUpdate original:
+
+- Mesmos endereços de funções HV: `HvpRelocateCacheLines = 0x00000E14`, `HvpSetRMCI = 0x00000398`
+- Mesmo endereço físico do segmento 3 do HV: `0x80000106.00030000`
+- Mesmos endereços de patch RSA: HV em `0x80000104.00029B04`, kernel em `0x80000300.0007BFDC`
+- O mesmo binário de dados limpos do HV (`Stage4_CleanHvData_Retail_17559.bin`) é usado
+- A mesma sequência completa: SMC LED → restaurar segmento 3 → patch HV → desabilitar RMCI → patch kernel → reabilitar RMCI → retornar `0x41414141`
+
+---
+
+## Tabela de Diferenças de Código: BadUpdate vs ABadAvatar
+
+| Aspecto | BadUpdate (grimdoomer) | ABadAvatar (shutterbug2000) |
+|---|---|---|
+| **Vetor de ataque inicial** | Save game de jogo (THAW gap name overflow, ou RBB) | Item de Avatar no perfil do usuário na flash |
+| **Jogo necessário** | Sim (THAW NTSC/PAL/RF ou Rock Band Blitz) | Não — funciona direto do dashboard |
+| **Contexto de execução** | Processo de jogo (Ring 3) | XamTask do `xam.xex` (Ring 3) |
+| **Namespace de symlink** | `\??` | `\System??` |
+| **Stage 1 como arquivo** | Save game no cartão USB | Offset `0x2200` no arquivo de item de Avatar na flash |
+| **Stage 0** | N/A (overflow direto para stack pivot) | Payload comprimido no item de Avatar: exibe texto + stack pivot |
+| **`_second_stage_chain_address`** | `0x00000000` (preenchido em runtime) | `second_stage_chain_addressA` (hardcoded da `Avatar.asm`) |
+| **`_overwrite_loop_secondary_buffer_address`** | `0x00000000` (preenchido em runtime) | `overwrite_loop_secondary_buffer_address_hardcoded` |
+| **Oracle XEX na flash** | `Flash:\\bootanim.xex` | `\\Device\\Flash\\GamerProfile.xex` |
+| **Endereço de carga da Stage 3** | `0x98030000` | `0x90110000` |
+| **Padding da Stage 3** | Não requerido | Necessário: pad até `0x10000` bytes com `4E 80 00 20` (`blr`) |
+| **Sequência de saída antes da Stage 3** | Não existe — chama Stage 3 diretamente | Sim — sequência de 7+ gadgets para sair da XamTask e criar nova task |
+| **Estrutura `_new_task_attributes`** | Não existe | Presente no segmento de dados |
+| **`BuildConfig.asm` — target** | `TONY_HAWK_AW` ou `RB_BLITZ` | `AVATAR` (novo) |
+| **Arquivo de config de jogo** | `TonyHawk.asm` / `RBBlitz.asm` | `Avatar.asm` (novo) |
+| **Lógica da race condition (Stage 3)** | Implementação completa em C/asm | Idêntica — mesmo arquivo asm |
+| **Stage 4 (hypervisor shellcode)** | Implementação original | Idêntica ao original |
+| **Nome do payload de saída** | `PAYLOAD:\\default.xex` | `PAYLOAD:\\BadNyan.xex` (nome de exemplo) |
+
+---
+
+## Fluxo de Execução Completo do ABadAvatar
+
+```
+Dashboard (Ring 3, XamTask)
+    → processa item de Avatar do perfil do usuário
+    → descomprime e executa Stage 0 (estático, no item de Avatar)
+    → Stage 0: exibe texto anti-golpe
+    → Stage 0: stack pivot para Stage 1 (offset 0x2200 no item de Avatar)
+
+Stage 1 (Ring 3, XamTask)
+    → memcpy do segmento de dados para região gravável
+    → NtAllocateVirtualMemory para Stage 2
+    → ObCreateSymbolicLink monta PAYLOAD: → USB (\System??\PAYLOAD:)
+    → ObCreateSymbolicLink monta Flash: → flash interna (\System??\Flash:)
+    → lê BadUpdateExploit-2ndStage.bin do USB
+    → stack pivot para Stage 2
+
+Stage 2 (Ring 3, XamTask)
+    → sinaliza via LEDs
+    → carrega GamerProfile.xex (\Device\Flash\GamerProfile.xex)
+    → captura oracle plain-text da página de código
+    → loop: carrega/descarrega GamerProfile.xex, captura cipher text, compara com oracle
+    → escreve cipher text da Stage 3 na página de código (0x90110000)
+    → flush de cache (virtual + físico)
+    → sequência de saída de XamTask (7+ gadgets):
+        → desregistra XamTask atual
+        → cria nova XamTask apontando para 0x90110000
+        → suspende thread atual
+
+Stage 3 (Ring 0, nova XamTask ou thread independente)
+    → lê update_data.bin e BadUpdateExploit-4thStage.bin do USB
+    → pré-computa tabela de cipher text (1024 variantes de whitening)
+    → expõe cipher text do segmento 3 do HV via MmPhysical64KBMappingTable
+    → thread worker (core 1): martela HvxKeysExecute em loop,
+      monitora HV cipher text para overwrite do Block 14,
+      no sucesso sobrescreve syscall table + chama Stage 4 + XLaunchNewImage
+    → thread principal: loop apertado lê cipher text do scratch buffer,
+      compara com tabela de lookup, atrasa, martela dec_output_buffer
+      com pointer cipher text malicioso para ganhar a race
+
+Stage 4 (Ring −1, hypervisor)
+    → LED laranja via SMC
+    → restaura segmento 3 corrompido do HV com cópia limpa embutida
+    → patch HV: bl XeCryptBnQwBeSigVerify → li r3, 1
+    → desabilita RMCI
+    → patch kernel: bl XeCryptBnQwBeSigVerify → li r3, 1
+    → reabilita RMCI
+    → retorna 0x41414141
+
+Stage 3 (Ring 0, de volta)
+    → LED verde
+    → XLaunchNewImage("PAYLOAD:\\BadNyan.xex")
+```
