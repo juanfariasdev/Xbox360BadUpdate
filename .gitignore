@@ -1,4 +1,5 @@
-Tools/
+Tools/XePatcher/
+nand_extracted/
 
 *.bin
 *.exe

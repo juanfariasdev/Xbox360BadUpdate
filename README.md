@@ -1761,3 +1761,201 @@ Stage4/
 ```
 
 Cada par `KernelConfig_Retail_<ver>.asm` + `Stage4_CleanHvData_Retail_<ver>.bin` representa um novo kernel suportado. Toda a lógica de código permanece intacta — apenas os dados de endereços mudam.
+
+---
+
+# Extraindo informações a partir de um dump da NAND (.bin)
+
+**Contexto:** A pergunta anterior listou seis categorias de dados necessárias para portar o exploit a um novo kernel. Esta seção responde: *"eu tenho um dump da NAND em .bin — consigo extrair essas informações?"*
+
+A resposta curta é: **parcialmente sim, mas algumas informações exigem a CPU key**, que não está presente no dump da NAND.
+
+---
+
+## O que está no dump da NAND
+
+O dump da NAND contém toda a cadeia de boot do Xbox 360:
+
+| Conteúdo | Formato | Criptografia |
+|---|---|---|
+| Bootloaders (1BL–CB–CD–CE/CF/CG) | Cabeçalho proprietário | Assinatura RSA (sem chave de CPU) |
+| Hypervisor (HV) | Binário PPC raw | **Criptografado com CPU key** |
+| `xboxkrnl.exe` (kernel) | XEX2 | **Criptografado com CPU key** |
+| `xam.xex` (dashboard system) | XEX2 | **Criptografado com CPU key** |
+| `bootanim.xex` e outros XEXs | XEX2 | **Criptografado com CPU key** |
+| Metadados do sistema de arquivos | FATX | Leitura direta |
+
+---
+
+## O que você PODE extrair sem a CPU key
+
+| Informação | Método | Relação com o port |
+|---|---|---|
+| **Versão do kernel** | Cabeçalho XEX2 (`execution_id`) não é criptografado | Identifica qual `KernelConfig_Retail_<ver>.asm` criar |
+| **Versão dos bootloaders** | Cabeçalho dos bootloaders é legível | Confirma revisão de hardware (Falcon/Jasper/Trinity) |
+| **Binários raw XEX2** | Arquivos extraídos do sistema de arquivos da NAND | Entrada para descriptografia com a CPU key |
+
+---
+
+## O que NÃO está acessível sem a CPU key
+
+| Informação | Por quê | Categoria do port |
+|---|---|---|
+| Endereços de funções do kernel | `xboxkrnl.exe` é criptografado | Categoria 1 |
+| Endereços de funções do XAM | `xam.xex` é criptografado | Categoria 2 |
+| Ordinals de syscall | Estão dentro do kernel (criptografado) | Categoria 3 |
+| Gadgets ROP | Estão no kernel e no XAM (criptografados) | Categoria 4 |
+| `BootAnimCodePageAddress` | Requer análise do `bootanim.xex` descriptografado | Categoria 5 |
+| Funções internas do HV | HV é criptografado com CPU key | Categoria 6 |
+| `Stage4_CleanHvData_*.bin` | Requer HV descriptografado | Categoria 6 |
+
+---
+
+## O que é a CPU key e onde ela está
+
+A **CPU key** é uma chave de 128 bits (32 caracteres hexadecimais) gravada permanentemente nos **eFuses do processador**. Ela não está na NAND, não está num arquivo, e não pode ser extraída remotamente.
+
+**Como obter a CPU key do seu console:**
+
+```
+Opção A — Console com JTAG ou RGH exploit (necessário):
+    1. Baixe o xell-reloaded (ou xell-gggggg)
+    2. Grave na NAND via JRunner ou nandpro
+    3. Ligue o console — o xell-reloaded exibe a CPU key via HDMI e porta UART
+    4. Copie os 32 caracteres hexadecimais
+
+Opção B — Console com RGH rodando via JRunner (Windows):
+    1. Conecte o console via USB (modo programador) com RGH ativo
+    2. Abra o JRunner → "Read Nand" → ele lê a CPU key automaticamente
+
+Opção C — Console JTAG com xbdm.xex rodando:
+    1. Conecte via Xenia Developer Kit ou Xbox 360 SDK debug tools
+    2. Leia o registro EFUSE_OVERRIDE / XeCryptEfuseRead via kernel debug calls
+```
+
+> **Importante:** Se o seu console **não** tem JTAG/RGH, você não consegue extrair a CPU key por software. O próprio BadUpdate exploit é o caminho para fazer seu console rodar código não-assinado — você não precisa da CPU key para rodar o exploit, apenas para construir o `KernelConfig` de uma nova versão.
+
+---
+
+## Ferramenta incluída: `Tools/nand_info.py`
+
+O repositório inclui um script Python que analisa um dump de NAND e extrai as informações disponíveis sem a CPU key:
+
+```bash
+# Requer Python 3.10 ou superior
+python3 Tools/nand_info.py <seu_dump.bin>
+
+# Com diretório de saída personalizado:
+python3 Tools/nand_info.py dump.bin -o meu_dump_extraido/
+
+# Só análise, sem gravar arquivos:
+python3 Tools/nand_info.py dump.bin --no-extract
+```
+
+**O que o script faz:**
+
+1. Detecta o formato do dump:
+   - `16 MB sem spare` (0x01000000 bytes) — dump limpo
+   - `16 MB com spare` (0x01080000 bytes) — dump com bytes ECC intercalados, que o script remove automaticamente
+   - Tamanhos desconhecidos (consoles Slim/eMMC) — tentativa parcial
+
+2. Escaneia os primeiros 32 blocos em busca de cabeçalhos de bootloader conhecidos (CB-A, CB-B, CD, CF, CG) e exibe a versão de cada um
+
+3. Escaneia todo o dump em busca do magic `XEX2` e para cada ocorrência:
+   - Parseia o cabeçalho opcional `execution_id` para extrair versão e `title_id`
+   - Identifica automaticamente o kernel (`title_id = 0x00000000`)
+   - Extrai o blob XEX2 bruto (ainda criptografado) para o diretório de saída
+
+4. Exibe o resumo: versão do kernel detectada, nome do `KernelConfig` correspondente, e próximos passos
+
+**Exemplo de saída para um dump com kernel 17559:**
+
+```
+[*] Loading: meu_dump.bin
+[*] File size : 0x01080000 bytes  (16.50 MB)
+[*] Format    : 16 MB small-block (WITH spare bytes — stripped to 0x01000000 bytes)
+
+[*] Scanning for bootloader headers …
+    offset 0x00004000  magic=0x0220  CB-B  (Jasper 16 MB)   version= 1888 (0x0760)  size=0x8000
+
+[*] Scanning for XEX2 binaries …
+    Found 3 XEX2 magic occurrence(s)
+
+    XEX2 at 0x00ABC000:
+      version   = 2.0.17559.0  (build 17559 = 0x4497)
+      title_id  = 0x00000000  ← likely kernel (xboxkrnl.exe)
+      *** Identified as kernel — build 17559 ***
+      Extracted (raw/encrypted) → nand_extracted/xex2_offset_0x00ABC000.xex
+    ...
+
+SUMMARY
+  Kernel version : 17559  (0x4497)
+  KernelConfig   : Common/KernelConfig_Retail_17559.asm
+```
+
+---
+
+## Workflow completo: do dump da NAND até o `KernelConfig`
+
+```
+dump.bin (NAND bruta)
+    │
+    ▼
+python3 Tools/nand_info.py dump.bin
+    │
+    ├─ Detecta versão do kernel (sem CPU key)
+    │      → Cria Common/KernelConfig_Retail_<ver>.asm
+    │
+    └─ Extrai XEX2 brutos → nand_extracted/*.xex
+           │
+           ▼  (requer CPU key)
+       xextool -k <CPU_KEY> xex2_offset_*.xex
+           │
+           ├─ xboxkrnl_dec.bin  → IDA/Ghidra (PPC64 BE)
+           │       │
+           │       ├─ Funções exportadas    → Categoria 1 (kernel functions)
+           │       ├─ Ordinals de syscall   → Categoria 3 (sc_Hvx*)
+           │       ├─ Gadgets ROP           → Categoria 4 (kernel gadgets)
+           │       ├─ XexpVerifyXexHeaders  → Categoria 6b (kernel RSA patch offset)
+           │       └─ BootAnimCodePageAddr  → Categoria 5 (analisar loader do bootanim)
+           │
+           ├─ xam_dec.bin       → IDA/Ghidra (PPC64 BE)
+           │       │
+           │       ├─ Export table (ordinals) → Categoria 2 (XAM functions)
+           │       └─ Gadgets ROP            → Categoria 4 (XAM gadgets)
+           │
+           └─ hypervisor_dec.bin → IDA/Ghidra (PPC32 BE, no-MMU segment)
+                   │
+                   ├─ HvpRelocateCacheLines → Categoria 6a
+                   ├─ HvpSetRMCI           → Categoria 6a
+                   ├─ HvpImageSignatureVerification → Categoria 6b (HV RSA patch offset)
+                   └─ Últimos 0x10000 bytes do HV → Stage4_CleanHvData_Retail_<ver>.bin
+```
+
+---
+
+## Formatos de dump suportados
+
+| Tamanho do arquivo | Formato | Suportado |
+|---|---|---|
+| 0x01000000 (16 MB) | Small-block sem spare | ✅ Sim |
+| 0x01080000 (16,5 MB) | Small-block com spare ECC | ✅ Sim (spare removido automaticamente) |
+| 0x04000000 (64 MB) | Big-block Jasper 256MB? | ⚠️ Tentativa parcial |
+| 0x40000000 (1 GB+) | Trinity/Corona eMMC | ❌ Não suportado |
+
+Para dumps de consoles Slim (Trinity/Corona/Winchester) o layout eMMC é diferente e o script atual não suporta. Nesses casos, use ferramentas específicas como o **xeBuild** ou **JRunner** que têm suporte específico para eMMC.
+
+---
+
+## Ferramentas externas necessárias
+
+| Ferramenta | Uso | Onde encontrar |
+|---|---|---|
+| **xextool** | Descriptografar XEX2 com CPU key | Compilar do source free60 ou releases da comunidade |
+| **xbdecompress** | Descomprimir dados LZX do Xbox 360 | free60 / GITHUB |
+| **JRunner** | Extrair CPU key de console JTAG/RGH via USB | jrunner.codeplex.com (arquivado) / GitHub mirrors |
+| **xell-reloaded** | Obter CPU key via HDMI/UART no console | GitHub: xell-reloaded |
+| **IDA Pro** | Disassembler para PPC64 BE | Comercial (versão gratuita limitada disponível) |
+| **Ghidra** | Disassembler gratuito com suporte a PPC64 | ghidra.re |
+| **Radare2** | Disassembler open-source | rada.re |
+
