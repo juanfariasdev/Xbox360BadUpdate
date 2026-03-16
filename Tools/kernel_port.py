@@ -92,6 +92,7 @@ XEX2_MAGIC = b"XEX2"  # 0x58455832
 
 XEX_OPT_EXECUTION_ID  = 0x00040006   # execution / version information block
 XEX_OPT_EXPORT_TABLE  = 0x00400100   # VA of the IMAGE_EXPORT_DIRECTORY (inline)
+XEX_OPT_BASE_ADDRESS  = 0x00010201   # image base VA (inline; present in all retail XEX2s)
 
 MAX_OPT_HEADERS       = 256          # sanity cap
 
@@ -100,7 +101,8 @@ MAX_OPT_HEADERS       = 256          # sanity cap
 #   +0x004  DWORD  info_size (total byte length of this structure)
 #   +0x008  BYTE[0x100]  rsa_signature
 #   +0x108  DWORD  image_flags
-#   +0x10C  DWORD  load_address  ← image base VA
+#   +0x10C  DWORD  load_address  ← image base VA (may read 0 in encrypted files;
+#                                   prefer XEX_OPT_BASE_ADDRESS optional header instead)
 SECURITY_CERT_LOAD_ADDR_OFF = 0x10C
 
 
@@ -583,10 +585,15 @@ def parse_xex2(data: bytes) -> Optional[dict]:
         v = _r32(data, off + 4)
         opt[k] = v
 
-    # --- Security certificate: get load_address ---
-    load_address = 0
-    if security_info_offset and security_info_offset + SECURITY_CERT_LOAD_ADDR_OFF + 4 <= len(data):
-        load_address = _r32(data, security_info_offset + SECURITY_CERT_LOAD_ADDR_OFF)
+    # --- Load address: prefer optional header 0x00010201 when present.
+    #     The security-cert field (+0x10C) may contain the image_flags value
+    #     rather than the load address in some encrypted retail XEX2 files, so
+    #     the optional header is the authoritative source.
+    load_address = opt.get(XEX_OPT_BASE_ADDRESS, 0)
+    if not load_address:
+        # Fall back to the security certificate field for older / decrypted files.
+        if security_info_offset and security_info_offset + SECURITY_CERT_LOAD_ADDR_OFF + 4 <= len(data):
+            load_address = _r32(data, security_info_offset + SECURITY_CERT_LOAD_ADDR_OFF)
 
     # --- Export table VA (inline in optional header 0x00400100) ---
     export_table_va = opt.get(XEX_OPT_EXPORT_TABLE, 0)

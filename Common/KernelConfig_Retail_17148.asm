@@ -1,5 +1,5 @@
 # KernelConfig_Retail_17148.asm
-# Kernel version: 17148  (0x42DC)
+# Kernel version: 17148  (0x42FC)
 #
 # HOW TO FILL THIS IN
 # ===================
@@ -72,7 +72,7 @@
 .set sc_HvxArbWriteSyscall,             sc_HvxFlushUserModeTb
 
 # Boot animation addresses:
-.set BootAnimCodePageAddress,           0x00000000  # TODO: load address of bootanim.xex (run kernel_port.py --bootanim)
+.set BootAnimCodePageAddress,           0x98000000
 
 # Xam function addresses:
 .set CreateFileA,                       0x00000000  # TODO: Export 1095
